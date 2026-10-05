@@ -1,24 +1,24 @@
-"""All Google Sheet reads/writes for one profile's job sheet.
+"""All Google Sheet reads and writes for one profile's sheet.
 
-CLI (each subcommand prints JSON to stdout, or reads/writes files):
-    python scripts/sheet.py init-tabs      --profile <name>
-    python scripts/sheet.py test-write     --profile <name>
-    python scripts/sheet.py meta           --profile <name>
-    python scripts/sheet.py rules          --profile <name> --out rules.json
-    python scripts/sheet.py preferences    --profile <name> --out prefs.json
-    python scripts/sheet.py changed-status --profile <name> --out changed.json
-    python scripts/sheet.py dedupe         --profile <name> --in raw.json --out deduped.json
-    python scripts/sheet.py append-jobs    --profile <name> --in jobs.json
-    python scripts/sheet.py update-meta    --profile <name> --set last_run_iso=... --set ...
+CLI (each subcommand prints a short result, or reads/writes JSON files):
+    python scripts/sheet.py --profile <name> init-tabs
+    python scripts/sheet.py --profile <name> test-write
+    python scripts/sheet.py --profile <name> meta
+    python scripts/sheet.py --profile <name> rules          --out rules.json
+    python scripts/sheet.py --profile <name> add-rules      --in new_rules.json
+    python scripts/sheet.py --profile <name> preferences    --out prefs.json
+    python scripts/sheet.py --profile <name> changed-status --out changed.json
+    python scripts/sheet.py --profile <name> mark-status-synced --job-ids 123 456
+    python scripts/sheet.py --profile <name> dedupe         --in raw.json --out deduped.json
+    python scripts/sheet.py --profile <name> append-jobs    --in jobs.json
+    python scripts/sheet.py --profile <name> update-jobs    --in results.json
+    python scripts/sheet.py --profile <name> update-meta    --set last_run_iso=... --set ...
+    python scripts/sheet.py --profile <name> apply-status-validation
 
-One tab holds every job the agent has ever seen for this profile — scored high,
-scored low, or blocked by a rule — sorted by score, nothing hidden in a second
-tab. The person only ever edits Status and Reason; everything else is agent-
-written. See CLAUDE.md's "Sheet design" section for the reasoning.
-
-Auth: a Google service account key (default secrets/service-account.json, override with
-`credentials:` in config.yaml) with the sheet shared to its client_email as Editor.
-See docs/google-sheet-setup.md for setup.
+One tab holds every job the agent has ever seen for this profile: scored high, scored
+low, or blocked by a rule. Nothing is hidden in a second tab. The person only edits
+Status and Reason; everything else is agent-written. The layout and pure logic live in
+sheet_schema.py. Auth is a Google service account key; see docs/google-sheet-setup.md.
 """
 
 from __future__ import annotations
@@ -28,98 +28,27 @@ import json
 from pathlib import Path
 from typing import Any
 
-from util import (
-    is_repost,
-    load_config,
-    load_json,
-    now_iso,
-    save_json,
-    credentials_path,
+from config import credentials_path, load_config
+from sheet_schema import (
+    JOBS_TAB,
+    LEGACY_STATUS_SNAPSHOT_KEY,
+    META_TAB,
+    PREFERENCES_SEED_ROWS,
+    PREFERENCES_TAB,
+    RULES_TAB,
+    SCORING_HEADERS,
+    STATUS_SYNC_TAB,
+    STATUS_VALUES,
+    TAB_HEADERS,
+    find_changed_status_rows,
+    job_to_row,
+    snapshot_entry,
 )
+from util import is_repost, load_json, now_iso, save_json, unwrap_jobs
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-JOBS_TAB = "Jobs"
-RULES_TAB = "AI_Rules"
-META_TAB = "AI_MetaData"
-PREFERENCES_TAB = "Preferences"
-
-# Jobs and Preferences are the job seeker's tabs; the "AI_" prefix on the other two
-# marks them as agent-owned bookkeeping, not something the person needs to open.
-
-JOBS_HEADERS = [
-    "Date added", "Score", "Job ID", "Job title", "Company", "Location", "Posted",
-    "Link", "Why it matches", "Gaps", "Flags", "Role type",
-    "Status", "Reason",
-]
-RULES_HEADERS = ["Rule", "Type", "Keywords", "Based on", "Added by", "Active"]
-META_HEADERS = ["Key", "Value"]
-PREFERENCES_HEADERS = ["Criterion", "Value", "Example"]
-
-STATUS_VALUES = [
-    "New", "Interested", "Applied", "Not for me",
-    "Rejected by company", "Interview", "Offer",
-]
-
-# Seeded once when the tab is created. Value stays blank until the job seeker fills
-# it in directly in Sheets — a blank Value means "no preference stated," and the
-# scorer falls back to profile.md / general judgment for that criterion.
-PREFERENCES_SEED_ROWS = [
-    (
-        "What are you hoping this next role looks like?",
-        "",
-        'e.g. "Open to a team-lead role if the opportunity is right" or '
-        '"Prefer to stay hands-on, not managing people yet"',
-    ),
-    (
-        "Minimum acceptable salary (include currency and period)",
-        "",
-        'e.g. "60,000 per year" or "Not fixed, depends on the role"',
-    ),
-    (
-        "Certifications or training in progress or planned",
-        "",
-        'e.g. "Studying for a PMP, finishing 2027" or "None currently"',
-    ),
-    (
-        "Contract type",
-        "",
-        'e.g. "Permanent only" or "Open to fixed-term if the pay is good"',
-    ),
-    (
-        "Work setup (on-site, hybrid, remote)",
-        "",
-        'e.g. "Hybrid or remote only" or "Happy to be on-site"',
-    ),
-    (
-        "Work authorization or relocation notes",
-        "",
-        'e.g. "Need visa sponsorship" or "Can relocate within the country"',
-    ),
-    (
-        "Industries or company types preferred",
-        "",
-        'e.g. "Healthcare, logistics" or "No preference"',
-    ),
-    (
-        "Industries or company types to avoid",
-        "",
-        'e.g. "Gambling" or "None"',
-    ),
-    (
-        "Tools or software you use, beyond what's on your resume",
-        "",
-        'e.g. "Salesforce" or "None"',
-    ),
-]
-
-# Meta key holding a {job_id: "status||reason"} JSON blob — the last Status/Reason
-# the learning step has already read for each job. Keeping this in Meta (instead of
-# a second column next to Status in Jobs) keeps Jobs to exactly one status-shaped
-# column for the person to edit.
-STATUS_SYNC_META_KEY = "status_sync_snapshot"
-
 REPOST_WINDOW_DAYS = 30
+AGENT_RULE_AUTHOR = "AI"  # rules with any other "Added by" were written by a human
 
 
 class SheetClient:
@@ -142,57 +71,83 @@ class SheetClient:
                     f"Step-by-step: docs/google-sheet-setup.md"
                 )
             creds = Credentials.from_service_account_file(str(key_path), scopes=SCOPES)
-            client = gspread.authorize(creds)
-            self._spreadsheet = client.open_by_key(self.config["sheet_id"])
+            self._spreadsheet = gspread.authorize(creds).open_by_key(self.config["sheet_id"])
         return self._spreadsheet
 
-    def _worksheet(self, title: str, headers: list[str]):
+    # ---- Tabs ---------------------------------------------------------------
+
+    def _open_or_create(self, title: str):
+        """Returns (worksheet, created). A new tab gets its header row and a frozen top row."""
         import gspread
 
         try:
-            return self.spreadsheet.worksheet(title)
+            return self.spreadsheet.worksheet(title), False
         except gspread.WorksheetNotFound:
+            headers = TAB_HEADERS[title]
             ws = self.spreadsheet.add_worksheet(title=title, rows=1000, cols=len(headers))
             ws.append_row(headers)
             ws.freeze(rows=1)
-            return ws
+            return ws, True
+
+    def _worksheet(self, title: str):
+        return self._open_or_create(title)[0]
 
     def init_tabs(self) -> None:
-        self._worksheet(JOBS_TAB, JOBS_HEADERS)
-        self._worksheet(RULES_TAB, RULES_HEADERS)
-        self._worksheet(META_TAB, META_HEADERS)
-        self.ensure_preferences_seeded()
+        """Create any missing tab and header, seed Preferences, apply the Status dropdown.
+        Safe to re-run: it only ever adds, never overwrites what the person has entered."""
+        for title in (JOBS_TAB, RULES_TAB, META_TAB):
+            self._worksheet(title)
+        self._ensure_missing_headers(JOBS_TAB)
+        self._ensure_preferences_seeded()
+        self._status_sync_worksheet()
         self.apply_status_validation()
 
-    def ensure_preferences_seeded(self) -> None:
-        """Create the Preferences tab with example rows if it doesn't exist yet.
-        Never touches it if it already exists — the job seeker's filled-in Values
-        must never be overwritten by re-running setup."""
+    def _ensure_missing_headers(self, title: str) -> None:
+        """Append headers an older sheet lacks (e.g. after a release adds a column)."""
         import gspread
 
+        ws = self._worksheet(title)
+        existing = ws.row_values(1)
+        missing = [h for h in TAB_HEADERS[title] if h not in existing]
+        if missing:
+            ws.update_cells(
+                [gspread.Cell(1, len(existing) + i + 1, h) for i, h in enumerate(missing)]
+            )
+
+    def _ensure_preferences_seeded(self) -> None:
+        """Create Preferences with example rows if absent. Never touches an existing tab;
+        the person's filled-in values must survive re-running setup."""
+        ws, created = self._open_or_create(PREFERENCES_TAB)
+        if created:
+            ws.append_rows([list(row) for row in PREFERENCES_SEED_ROWS])
+
+    def _status_sync_worksheet(self):
+        """AI_StatusSync, created on first use and seeded from the legacy single-cell
+        snapshot (older sheets) so no feedback already read is read again."""
+        ws, created = self._open_or_create(STATUS_SYNC_TAB)
+        if not created:
+            return ws
+        raw = self.get_meta().get(LEGACY_STATUS_SNAPSHOT_KEY, "")
         try:
-            self.spreadsheet.worksheet(PREFERENCES_TAB)
-            return  # already exists — leave whatever the job seeker has entered alone
-        except gspread.WorksheetNotFound:
-            pass
-        ws = self.spreadsheet.add_worksheet(
-            title=PREFERENCES_TAB, rows=50, cols=len(PREFERENCES_HEADERS)
-        )
-        ws.append_row(PREFERENCES_HEADERS)
-        ws.append_rows([list(row) for row in PREFERENCES_SEED_ROWS])
-        ws.freeze(rows=1)
+            legacy = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            legacy = {}
+        rows = [
+            [job_id, *entry.split("||", 1)] for job_id, entry in legacy.items() if "||" in entry
+        ]
+        if rows:
+            ws.append_rows(rows)
+        return ws
 
     def apply_status_validation(self) -> None:
-        """Add the Status dropdown (STATUS_VALUES) to the Jobs tab, and only there.
+        """Put the Status dropdown on the Jobs Status column, and only there.
 
-        Clears validation across the whole Jobs data range first. Without that, a
-        rule set on the Status column under an older header order (e.g. before a
-        column reorder) lingers on whatever column now sits at that old position —
-        which is exactly how Role type ended up showing the Status dropdown after
-        Status moved from column L to column M."""
-        from gspread.utils import ValidationConditionType
+        Clears validation over the whole data range first, so a dropdown left on whatever
+        column Status used to occupy before a column reorder can't linger."""
+        from gspread.utils import ValidationConditionType, rowcol_to_a1
 
-        ws = self._worksheet(JOBS_TAB, JOBS_HEADERS)
+        ws = self._worksheet(JOBS_TAB)
+        headers = ws.row_values(1)
         self.spreadsheet.batch_update(
             {
                 "requests": [
@@ -202,46 +157,50 @@ class SheetClient:
                                 "sheetId": ws.id,
                                 "startRowIndex": 1,
                                 "startColumnIndex": 0,
-                                "endColumnIndex": len(JOBS_HEADERS),
+                                "endColumnIndex": len(headers),
                             }
                         }
                     }
                 ]
             }
         )
-        col_letter = chr(ord("A") + JOBS_HEADERS.index("Status"))
+        letter = rowcol_to_a1(1, headers.index("Status") + 1).rstrip("0123456789")
         ws.add_validation(
-            f"{col_letter}2:{col_letter}",
+            f"{letter}2:{letter}",
             ValidationConditionType.one_of_list,
             STATUS_VALUES,
             showCustomUi=True,
         )
 
     def test_write(self) -> None:
-        ws = self._worksheet(META_TAB, META_HEADERS)
-        ws.append_row(["test_write", now_iso()])
+        self._worksheet(META_TAB).append_row(["test_write", now_iso()])
 
-    # ---- Meta -----------------------------------------------------------
+    # ---- Meta ---------------------------------------------------------------
 
     def get_meta(self) -> dict[str, str]:
-        ws = self._worksheet(META_TAB, META_HEADERS)
-        rows = ws.get_all_records()
+        rows = self._worksheet(META_TAB).get_all_records()
         return {str(r["Key"]): str(r["Value"]) for r in rows if r.get("Key")}
 
     def update_meta(self, updates: dict[str, str]) -> None:
-        ws = self._worksheet(META_TAB, META_HEADERS)
-        rows = ws.get_all_values()[1:]  # skip header
-        existing_keys = {row[0]: idx for idx, row in enumerate(rows, start=2) if row}
+        ws = self._worksheet(META_TAB)
+        row_of_key = {
+            row[0]: idx for idx, row in enumerate(ws.get_all_values()[1:], start=2) if row
+        }
+        changes, new_rows = [], []
         for key, value in updates.items():
-            if key in existing_keys:
-                ws.update(f"A{existing_keys[key]}:B{existing_keys[key]}", [[key, value]])
+            if key in row_of_key:
+                rng = f"A{row_of_key[key]}:B{row_of_key[key]}"
+                changes.append({"range": rng, "values": [[key, value]]})
             else:
-                ws.append_row([key, value])
+                new_rows.append([key, value])
+        if changes:
+            ws.batch_update(changes)
+        if new_rows:
+            ws.append_rows(new_rows)
 
-    # ---- Rules ------------------------------------------------------------
+    # ---- Rules and preferences ---------------------------------------------
 
     def get_rules(self) -> list[dict[str, Any]]:
-        ws = self._worksheet(RULES_TAB, RULES_HEADERS)
         return [
             {
                 "rule": r.get("Rule", ""),
@@ -251,45 +210,48 @@ class SheetClient:
                 "added_by": r.get("Added by", ""),
                 "active": r.get("Active", ""),
             }
-            for r in ws.get_all_records()
+            for r in self._worksheet(RULES_TAB).get_all_records()
         ]
 
-    # ---- Preferences --------------------------------------------------------
+    def append_rules(self, rules: list[dict[str, Any]]) -> None:
+        """Add learned rules ({rule, type, keywords, based_on}); marked as agent-written."""
+        rows = [
+            [
+                r["rule"],
+                r["type"],
+                r.get("keywords", ""),
+                r.get("based_on", ""),
+                r.get("added_by", AGENT_RULE_AUTHOR),
+                r.get("active", "Yes"),
+            ]
+            for r in rules
+        ]
+        if rows:
+            self._worksheet(RULES_TAB).append_rows(rows)
 
     def get_preferences(self) -> list[dict[str, str]]:
-        """Only rows the job seeker actually filled in — blank Value means no
-        preference stated, so the scorer should ignore that row entirely."""
-        ws = self._worksheet(PREFERENCES_TAB, PREFERENCES_HEADERS)
+        """Only rows the person filled in. A blank Value means no preference was stated."""
         return [
             {"criterion": r.get("Criterion", ""), "value": r.get("Value", "")}
-            for r in ws.get_all_records()
+            for r in self._worksheet(PREFERENCES_TAB).get_all_records()
             if str(r.get("Value", "")).strip()
         ]
 
-    # ---- Dedupe -----------------------------------------------------------
-
-    def get_known_job_ids(self) -> set[str]:
-        ws = self._worksheet(JOBS_TAB, JOBS_HEADERS)
-        return {
-            str(row.get("Job ID", "")).strip()
-            for row in ws.get_all_records()
-            if str(row.get("Job ID", "")).strip()
-        }
-
-    def get_recent_jobs_for_repost_check(self) -> list[dict[str, Any]]:
-        ws = self._worksheet(JOBS_TAB, JOBS_HEADERS)
-        return [
-            {
-                "title": row.get("Job title", ""),
-                "company": row.get("Company", ""),
-                "posted_date": row.get("Posted") or None,
-            }
-            for row in ws.get_all_records()
-        ]
+    # ---- Dedupe -------------------------------------------------------------
 
     def dedupe(self, jobs: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-        known_ids = self.get_known_job_ids()
-        recent = self.get_recent_jobs_for_repost_check()
+        """Split fetched jobs into genuinely new ones and reposts (same company and title as
+        a recent posting). Jobs whose ID is already in the sheet are dropped."""
+        records = self._worksheet(JOBS_TAB).get_all_records()
+        known_ids = {str(r.get("Job ID", "")).strip() for r in records} - {""}
+        recent = [
+            {
+                "title": r.get("Job title", ""),
+                "company": r.get("Company", ""),
+                "posted_date": r.get("Posted") or None,
+            }
+            for r in records
+        ]
 
         new_jobs, reposts = [], []
         for job in jobs:
@@ -303,226 +265,178 @@ class SheetClient:
                 window_days=REPOST_WINDOW_DAYS,
             ):
                 reposts.append(job)
-                continue
-            new_jobs.append(job)
+            else:
+                new_jobs.append(job)
         return {"new": new_jobs, "reposts": reposts}
 
-    # ---- Status changes (feedback for the learning step) -----------------
+    # ---- Feedback (Status/Reason) for the learning step -----------------------
 
-    def _get_status_sync_snapshot(self) -> dict[str, str]:
-        raw = self.get_meta().get(STATUS_SYNC_META_KEY, "")
-        if not raw:
-            return {}
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
+    def _status_snapshot(self) -> dict[str, str]:
+        records = self._status_sync_worksheet().get_all_records()
+        return {
+            str(r["Job ID"]): snapshot_entry(str(r.get("Status", "")), str(r.get("Reason", "")))
+            for r in records
+            if r.get("Job ID")
+        }
 
-    def get_changed_status_rows(self) -> list[dict[str, Any]]:
-        ws = self._worksheet(JOBS_TAB, JOBS_HEADERS)
-        snapshot = self._get_status_sync_snapshot()
-        changed = []
-        for row in ws.get_all_records():
-            job_id = str(row.get("Job ID", ""))
-            status = str(row.get("Status", "")).strip()
-            reason = str(row.get("Reason", "")).strip()
-            current = f"{status}||{reason}"
-            # A freshly written row says "New" with no reason; that isn't feedback.
-            if status == "New" and not reason and job_id not in snapshot:
-                continue
-            if status and current != snapshot.get(job_id, ""):
-                changed.append(
-                    {
-                        "job_id": job_id,
-                        "title": row.get("Job title", ""),
-                        "company": row.get("Company", ""),
-                        "status": status,
-                        "reason": reason,
-                    }
-                )
-        return changed
+    def get_changed_status_rows(self) -> list[dict[str, str]]:
+        records = self._worksheet(JOBS_TAB).get_all_records()
+        return find_changed_status_rows(records, self._status_snapshot())
 
     def mark_status_synced(self, job_ids: list[str]) -> None:
-        """After the learning step reads feedback, snapshot Status+Reason (in Meta,
-        not a sheet column) so the same row isn't treated as 'changed' again."""
-        ws = self._worksheet(JOBS_TAB, JOBS_HEADERS)
-        snapshot = self._get_status_sync_snapshot()
-        wanted = set(job_ids)
-        for row in ws.get_all_records():
-            job_id = str(row.get("Job ID", ""))
-            if job_id in wanted:
-                status = str(row.get("Status", "")).strip()
-                reason = str(row.get("Reason", "")).strip()
-                snapshot[job_id] = f"{status}||{reason}"
-        self.update_meta({STATUS_SYNC_META_KEY: json.dumps(snapshot, ensure_ascii=False)})
+        """After the learning step reads feedback, remember the Status+Reason it saw so the
+        same rows aren't treated as changed again. Kept in AI_StatusSync, not as a second
+        status-shaped column in Jobs, so the person only ever sees one Status column."""
+        wanted = {str(j) for j in job_ids}
+        current = {
+            str(r.get("Job ID", "")): [
+                str(r.get("Status", "")).strip(),
+                str(r.get("Reason", "")).strip(),
+            ]
+            for r in self._worksheet(JOBS_TAB).get_all_records()
+            if str(r.get("Job ID", "")) in wanted
+        }
+        ws = self._status_sync_worksheet()
+        row_of_job = {
+            row[0]: idx for idx, row in enumerate(ws.get_all_values()[1:], start=2) if row
+        }
 
-    # ---- Writing rows -------------------------------------------------------
+        changes, new_rows = [], []
+        for job_id, (status, reason) in current.items():
+            if job_id in row_of_job:
+                rng = f"A{row_of_job[job_id]}:C{row_of_job[job_id]}"
+                changes.append({"range": rng, "values": [[job_id, status, reason]]})
+            else:
+                new_rows.append([job_id, status, reason])
+        if changes:
+            ws.batch_update(changes)
+        if new_rows:
+            ws.append_rows(new_rows)
+
+    # ---- Writing job rows -----------------------------------------------------
 
     def append_jobs(self, jobs: list[dict[str, Any]]) -> None:
-        """Write jobs to the single Jobs tab — scored, low-scored, or blocked by
-        a rule all go here; only the Why/Gaps/Score fields differ. Sort jobs by
-        score (descending, blank/unscored last) before calling this so related
-        jobs land near each other."""
-        ws = self._worksheet(JOBS_TAB, JOBS_HEADERS)
-        rows = [
-            [
-                job.get("date_added", now_iso()[:10]),
-                job.get("score", ""),
-                job.get("job_id", ""),
-                job.get("title", ""),
-                job.get("company", ""),
-                job.get("location", ""),
-                job.get("posted_date", ""),
-                job.get("link", ""),
-                job.get("why") or job.get("filtered_reason", ""),
-                job.get("gaps", ""),
-                ", ".join(job.get("flags", [])) if isinstance(job.get("flags"), list) else job.get("flags", ""),
-                job.get("role_type", ""),
-                "New",
-                "",
-            ]
-            for job in jobs
-        ]
+        """Add jobs to the Jobs tab, scored, low-scored or blocked alike; only Why/Gaps/Score
+        differ. Columns are placed by the sheet's own header names, not by position."""
+        ws = self._worksheet(JOBS_TAB)
+        headers = ws.row_values(1)
+        today = now_iso()[:10]
+        rows = [job_to_row(job, headers, today) for job in jobs]
         if rows:
             ws.append_rows(rows)
 
     def update_jobs(self, jobs: list[dict[str, Any]]) -> int:
-        """Fill in Score/Why/Gaps/Flags/Role type on rows that are already in the
-        sheet (matched by Job ID) — doesn't touch Status/Reason or append new rows.
+        """Fill in Score/Why/Gaps/Flags/Role type on rows already in the sheet (matched by
+        Job ID). Never touches Status/Reason and never appends.
 
-        This is the second half of a "write early, fill in later" pattern: write
-        raw listings to the sheet immediately after dedupe (as "pending", via
-        append_jobs), so a crash during the slow description-fetch/scoring steps
-        never loses visibility into what was already found. Once scoring finishes,
-        call this to update those same rows in place instead of appending
-        duplicates. Rows whose Job ID isn't found are silently skipped — this
-        method only updates, it never creates. Returns how many rows were updated.
-        """
-        ws = self._worksheet(JOBS_TAB, JOBS_HEADERS)
+        Second half of "write early, fill in later": raw listings are appended as Pending right
+        after dedupe, so a crash during slow description-fetching or scoring never loses what
+        was found; this then updates those same rows in place. Unknown Job IDs are skipped.
+        Returns how many rows were updated."""
+        from gspread.utils import rowcol_to_a1
+
+        ws = self._worksheet(JOBS_TAB)
         rows = ws.get_all_values()
-        header = rows[0]
-        job_id_col = header.index("Job ID")
-        score_col = header.index("Score")
-        why_col = header.index("Why it matches")
-        gaps_col = header.index("Gaps")
-        flags_col = header.index("Flags")
-        role_type_col = header.index("Role type")
-
-        row_by_job_id = {
-            row[job_id_col]: idx
-            for idx, row in enumerate(rows[1:], start=2)
-            if len(row) > job_id_col
+        headers = rows[0]
+        id_col = headers.index("Job ID")
+        row_of_job = {
+            row[id_col]: idx for idx, row in enumerate(rows[1:], start=2) if len(row) > id_col
         }
+        scoring_cols = [(h, headers.index(h)) for h in SCORING_HEADERS if h in headers]
 
-        updates = []
-        updated_count = 0
+        updates, updated = [], 0
         for job in jobs:
-            row_idx = row_by_job_id.get(str(job.get("job_id", "")))
+            row_idx = row_of_job.get(str(job.get("job_id", "")))
             if row_idx is None:
                 continue
-            flags = job.get("flags", "")
-            flags_str = ", ".join(flags) if isinstance(flags, list) else flags
-            values = {
-                score_col: job.get("score", ""),
-                why_col: job.get("why") or job.get("filtered_reason", ""),
-                gaps_col: job.get("gaps", ""),
-                flags_col: flags_str,
-                role_type_col: job.get("role_type", ""),
-            }
-            for col, value in values.items():
-                col_letter = chr(ord("A") + col)
-                updates.append({"range": f"{col_letter}{row_idx}", "values": [[value]]})
-            updated_count += 1
+            for header, col in scoring_cols:
+                value = job_to_row(job, [header], "")[0]
+                updates.append({"range": rowcol_to_a1(row_idx, col + 1), "values": [[value]]})
+            updated += 1
 
         if updates:
             ws.batch_update(updates)
-        return updated_count
+        return updated
 
 
 # ---- CLI -------------------------------------------------------------------
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--profile", required=True)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("init-tabs")
-    sub.add_parser("test-write")
-    sub.add_parser("meta")
-    sub.add_parser("apply-status-validation")
+    for name in ("init-tabs", "test-write", "meta", "apply-status-validation"):
+        sub.add_parser(name)
 
-    rules_p = sub.add_parser("rules")
-    rules_p.add_argument("--out", type=Path, required=True)
-
-    prefs_p = sub.add_parser("preferences")
-    prefs_p.add_argument("--out", type=Path, required=True)
-
-    changed_p = sub.add_parser("changed-status")
-    changed_p.add_argument("--out", type=Path, required=True)
+    for name in ("rules", "preferences", "changed-status"):
+        sub.add_parser(name).add_argument("--out", type=Path, required=True)
 
     dedupe_p = sub.add_parser("dedupe")
     dedupe_p.add_argument("--in", dest="in_path", type=Path, required=True)
     dedupe_p.add_argument("--out", type=Path, required=True)
 
-    append_jobs_p = sub.add_parser("append-jobs")
-    append_jobs_p.add_argument("--in", dest="in_path", type=Path, required=True)
+    for name in ("add-rules", "append-jobs", "update-jobs"):
+        sub.add_parser(name).add_argument("--in", dest="in_path", type=Path, required=True)
 
-    update_jobs_p = sub.add_parser("update-jobs")
-    update_jobs_p.add_argument("--in", dest="in_path", type=Path, required=True)
+    sub.add_parser("update-meta").add_argument(
+        "--set", action="append", default=[], metavar="KEY=VALUE"
+    )
+    sub.add_parser("mark-status-synced").add_argument("--job-ids", nargs="+", required=True)
+    return parser
 
-    update_meta_p = sub.add_parser("update-meta")
-    update_meta_p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
 
-    sync_p = sub.add_parser("mark-status-synced")
-    sync_p.add_argument("--job-ids", nargs="+", required=True)
-
-    args = parser.parse_args()
+def main() -> None:
+    args = _build_parser().parse_args()
     client = SheetClient(args.profile)
+    command = args.command
 
-    if args.command == "init-tabs":
+    if command == "init-tabs":
         client.init_tabs()
-        print("Tabs ready: Jobs, Preferences, AI_Rules, AI_MetaData")
-    elif args.command == "test-write":
+        print("Tabs ready: Jobs, Preferences, AI_Rules, AI_MetaData, AI_StatusSync")
+    elif command == "test-write":
         client.test_write()
-        print("Wrote a test row to Meta.")
-    elif args.command == "apply-status-validation":
+        print("Wrote a test row to AI_MetaData.")
+    elif command == "apply-status-validation":
         client.apply_status_validation()
         print("Status dropdown applied to Jobs.")
-    elif args.command == "meta":
+    elif command == "meta":
         print(json.dumps(client.get_meta(), indent=2))
-    elif args.command == "rules":
+    elif command == "rules":
         save_json(args.out, client.get_rules())
         print(f"Wrote rules to {args.out}")
-    elif args.command == "preferences":
+    elif command == "add-rules":
+        rules = load_json(args.in_path)
+        client.append_rules(rules)
+        print(f"Added {len(rules)} rules to AI_Rules")
+    elif command == "preferences":
         save_json(args.out, client.get_preferences())
         print(f"Wrote preferences to {args.out}")
-    elif args.command == "changed-status":
+    elif command == "changed-status":
         save_json(args.out, client.get_changed_status_rows())
         print(f"Wrote changed-status rows to {args.out}")
-    elif args.command == "dedupe":
-        jobs = load_json(args.in_path)
-        jobs = jobs["jobs"] if isinstance(jobs, dict) else jobs
-        result = client.dedupe(jobs)
+    elif command == "mark-status-synced":
+        client.mark_status_synced(args.job_ids)
+        print(f"Synced status for {len(args.job_ids)} jobs")
+    elif command == "dedupe":
+        result = client.dedupe(unwrap_jobs(load_json(args.in_path)))
         save_json(args.out, result)
         print(f"{len(result['new'])} new, {len(result['reposts'])} reposts skipped")
-    elif args.command == "append-jobs":
-        jobs = load_json(args.in_path)
-        jobs = jobs["jobs"] if isinstance(jobs, dict) else jobs
+    elif command == "append-jobs":
+        jobs = unwrap_jobs(load_json(args.in_path))
         client.append_jobs(jobs)
         print(f"Appended {len(jobs)} rows to Jobs")
-    elif args.command == "update-jobs":
-        jobs = load_json(args.in_path)
-        jobs = jobs["jobs"] if isinstance(jobs, dict) else jobs
+    elif command == "update-jobs":
+        jobs = unwrap_jobs(load_json(args.in_path))
         updated = client.update_jobs(jobs)
         print(f"Updated {updated} of {len(jobs)} rows in Jobs (matched by Job ID)")
-    elif args.command == "update-meta":
+    elif command == "update-meta":
         updates = dict(item.split("=", 1) for item in args.set)
         client.update_meta(updates)
         print(f"Updated Meta: {updates}")
-    elif args.command == "mark-status-synced":
-        client.mark_status_synced(args.job_ids)
-        print(f"Synced status for {len(args.job_ids)} jobs")
 
 
 if __name__ == "__main__":

@@ -14,14 +14,16 @@ import re
 import shutil
 import sys
 
-from util import EXAMPLE_PROFILE, PROFILES_DIR, list_profiles
+from config import EXAMPLE_PROFILE, PROFILES_DIR, list_profiles
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("name", nargs="?", help="Folder name, e.g. jane-doe (lowercase, digits, dashes)")
+    parser.add_argument(
+        "name", nargs="?", help="Folder name, e.g. jane-doe (lowercase, digits, dashes)"
+    )
     parser.add_argument("--list", action="store_true", help="List existing profiles")
     args = parser.parse_args()
 

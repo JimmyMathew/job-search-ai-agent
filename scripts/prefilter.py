@@ -13,10 +13,11 @@ Sonnet scorer applies, not prefilter rules.
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 from typing import Any
 
-from util import load_json, save_json
+from util import load_json, save_json, unwrap_jobs
 
 
 def _active_block_rules(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -30,11 +31,11 @@ def _active_block_rules(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _matched_keyword(text: str, keywords: str) -> str | None:
-    haystack = text.lower()
-    for kw in keywords.split(";"):
-        kw = kw.strip()
-        if kw and kw.lower() in haystack:
-            return kw
+    """First of the `;`-separated keywords found in text as a whole word or phrase, so a
+    keyword like "sales" doesn't match "wholesales" and "ca" doesn't match "cat"."""
+    for keyword in (k.strip() for k in keywords.split(";")):
+        if keyword and re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", text, re.IGNORECASE):
+            return keyword
     return None
 
 
@@ -75,8 +76,7 @@ def main() -> None:
     parser.add_argument("--out-blocked", type=Path, required=True)
     args = parser.parse_args()
 
-    payload = load_json(args.in_path)
-    jobs = payload["jobs"] if isinstance(payload, dict) else payload
+    jobs = unwrap_jobs(load_json(args.in_path))
     rules = load_json(args.rules)
 
     passed, blocked = apply_block_rules(jobs, rules)

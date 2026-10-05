@@ -24,8 +24,9 @@ commands and read their small JSON/text output, don't re-derive what they alread
    current AI_Rules tab (`python scripts/sheet.py --profile $ARGUMENTS rules --out <run_dir>/rules.json`).
    For each changed row, work out what it teaches (see CLAUDE.md's "Learning loop" section for
    the Status → signal mapping and guardrails — 2+ similar rejections before a Block rule, never
-   touch a rule whose "Added by" is anything other than "AI", since those are human-written). Write any new/changed rules (with "Added by" set to `AI`) onto the AI_Rules
-   tab with a short inline gspread script, or ask if you're unsure — this is the one step
+   touch a rule whose "Added by" is anything other than "AI", since those are human-written). Write new rules (`rule`, `type`, `keywords`, `based_on` in a JSON list) with
+   `python scripts/sheet.py --profile $ARGUMENTS add-rules --in <run_dir>/new_rules.json`; they are
+   marked `Added by: AI` automatically. Ask the person if you're unsure — this is the one step
    worth being careful and deliberate about, since bad rules quietly hide good jobs later. Then
    `python scripts/sheet.py --profile $ARGUMENTS mark-status-synced --job-ids <ids>` so these
    rows aren't treated as "changed" again next run. Skip this whole step entirely if

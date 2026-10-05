@@ -23,21 +23,25 @@ from __future__ import annotations
 import argparse
 import logging
 import random
+import re
 import sys
 import time
 import types
 from pathlib import Path
 from typing import Any
 
-from util import extract_job_id, load_config, load_json, save_json
+from config import ProfileError, load_config, load_profile_md
+from util import extract_job_id, load_json, save_json, unwrap_jobs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("fetch")
 
-DEFAULT_RESULTS_PER_KEYWORD = 100  # JobSpy pages internally up to this many results (config: results_per_keyword)
+# JobSpy pages internally up to this many results per search (config: results_per_keyword)
+DEFAULT_RESULTS_PER_KEYWORD = 100
 PAUSE_BETWEEN_CALLS = (3.0, 7.0)  # seconds, randomized, between keyword/location searches
 PAUSE_BETWEEN_DESCRIPTIONS = (2.0, 5.0)  # seconds, randomized, between per-job description fetches
-MAX_CONSECUTIVE_EMPTY_DESCRIPTIONS = 5  # JobSpy swallows errors and returns "", so this is our block signal
+# JobSpy swallows errors and returns "", so a run of empty descriptions is our block signal
+MAX_CONSECUTIVE_EMPTY_DESCRIPTIONS = 5
 
 
 class LinkedInBlocked(RuntimeError):
@@ -56,7 +60,8 @@ def _normalize(row: dict[str, Any], keyword: str) -> dict[str, Any] | None:
     if not job_id:
         return None
     posted = row.get("date_posted")
-    posted = None if pd.isna(posted) else posted  # JobSpy leaves this NaT/NaN when LinkedIn omits it
+    # JobSpy leaves this NaT/NaN when LinkedIn omits it
+    posted = None if pd.isna(posted) else posted
     return {
         "job_id": job_id,
         "title": (row.get("title") or "").strip(),
@@ -104,7 +109,7 @@ def fetch_for_keyword(
 def fetch_all(profile: str, hours_old: int) -> tuple[list[dict[str, Any]], bool]:
     """Returns (jobs, was_blocked). Partial results are kept on a block."""
     config = load_config(profile)
-    keywords = _keywords_from_profile(profile, config["roles"])
+    keywords = _keywords_for(profile, config["roles"])
     locations: list[str] = config["locations"]
     results_wanted = int(config["results_per_keyword"])
 
@@ -131,40 +136,39 @@ def fetch_all(profile: str, hours_old: int) -> tuple[list[dict[str, Any]], bool]
     return all_jobs, blocked
 
 
-def _keywords_from_profile(profile: str, roles: list[str] | None = None) -> list[str]:
-    """Pull the numbered "Search keywords" list out of profile.md.
+_NUMBERED_ITEM_RE = re.compile(r"^\d+[.)]\s*(.+)$")
 
-    If profile.md has none, fall back to the roles listed in config.yaml."""
-    from util import ProfileError, load_profile_md
 
-    try:
-        text = load_profile_md(profile)
-    except ProfileError:
-        if roles:
-            return [str(r).strip() for r in roles if str(r).strip()]
-        raise
+def parse_search_keywords(profile_md: str) -> list[str]:
+    """The numbered list under "## Search keywords" in profile.md, e.g.
+    "1. Data Analyst" or "4. **Senior Analyst**" -> "Data Analyst", "Senior Analyst"."""
     keywords: list[str] = []
     in_section = False
-    for line in text.splitlines():
+    for line in profile_md.splitlines():
         stripped = line.strip()
         if stripped.lower().startswith("## search keywords"):
             in_section = True
-            continue
-        if in_section and stripped.startswith("##"):
+        elif in_section and stripped.startswith("##"):
             break
-        if in_section and stripped[:2].rstrip(".").isdigit():
-            # "1. Data Analyst" / "4. **Senior Analyst**" -> "Data Analyst"
-            _, _, rest = stripped.partition(".")
-            keyword = rest.strip().strip("*").strip()
-            if keyword:
-                keywords.append(keyword)
-    if not keywords and roles:
-        return [str(r).strip() for r in roles if str(r).strip()]
+        elif in_section:
+            item = _NUMBERED_ITEM_RE.match(stripped)
+            if item and item.group(1).strip("* "):
+                keywords.append(item.group(1).strip("* "))
+    return keywords
+
+
+def _keywords_for(profile: str, roles: list[str]) -> list[str]:
+    """Search keywords from profile.md, falling back to the roles in config.yaml when
+    profile.md doesn't exist yet or has no keyword list."""
+    try:
+        keywords = parse_search_keywords(load_profile_md(profile))
+    except ProfileError:
+        keywords = []
+    keywords = keywords or [str(r).strip() for r in roles if str(r).strip()]
     if not keywords:
-        raise RuntimeError(
-            f"Could not find a '## Search keywords' numbered list in "
-            f"profiles/{profile}/profile.md (and no `roles` in config.yaml). "
-            f"Run /job-setup {profile} to generate them."
+        raise ProfileError(
+            f"No search keywords for '{profile}': profile.md has no '## Search keywords' "
+            f"list and config.yaml has no `roles`. Run /job-setup {profile} to generate them."
         )
     return keywords
 
@@ -238,8 +242,7 @@ def main() -> None:
         if blocked:
             sys.exit(2)
     elif args.command == "descriptions":
-        payload = load_json(args.in_path)
-        jobs = payload["jobs"] if isinstance(payload, dict) else payload
+        jobs = unwrap_jobs(load_json(args.in_path))
         enriched, blocked = fetch_descriptions(jobs)
         save_json(args.out, {"jobs": enriched, "blocked": blocked, "count": len(enriched)})
         log.info(

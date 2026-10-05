@@ -83,3 +83,16 @@ This project is not affiliated with LinkedIn. LinkedIn's terms restrict automate
 tool makes low-volume, logged-out searches for personal use, but you use it at your own risk (for
 example, your connection may be temporarily blocked). Never run it logged in, from a shared or
 work network, or on a server. Provided as-is under the [MIT License](LICENSE).
+
+## For developers
+
+```
+uv sync                                  # installs dependencies plus pytest and ruff
+uv run pytest                            # unit tests (no network, no Google account needed)
+uv run ruff check scripts tests          # lint
+```
+
+Code map: `scripts/config.py` (profiles and config), `scripts/sheet_schema.py` (sheet layout and
+pure logic), `scripts/sheet.py` (Google Sheets I/O), `scripts/fetch.py` (LinkedIn search),
+`scripts/prefilter.py` (rule-based filtering), `scripts/doctor.py` (setup checks). Design notes
+and conventions are in `CLAUDE.md`.

@@ -26,9 +26,11 @@ CLAUDE.md
   commands/job-setup.md    # /job-setup <profile> — onboard a person or refresh their profile.md
   agents/job-scorer.md     # Sonnet subagent used by job-run's scoring step
 scripts/
-  util.py                  # shared helpers: config loading, job ID parsing, dedupe/repost logic
+  config.py                # profiles + config.yaml: locate, load, default, validate
+  util.py                  # JSON/time helpers, job ID parsing, repost logic
   fetch.py                 # JobSpy LinkedIn search, one profile's keywords × locations
-  sheet.py                 # all Google Sheet reads/writes (gspread)
+  sheet_schema.py          # sheet layout (tabs, headers, seed rows) + pure row/diff logic
+  sheet.py                 # all Google Sheet reads/writes (gspread) + CLI
   prefilter.py             # applies Block rules as keyword checks, no model involved
   new_profile.py           # creates profiles/<name>/ from the profiles/_example template
   doctor.py                # readiness checklist: packages, resume, config, Google key, sheet
@@ -40,6 +42,7 @@ profiles/
     profile.md             # written by /job-setup from the resume — what the scorer actually reads
 secrets/
   service-account.json     # Google credentials — git-ignored, never commit this
+tests/                     # pytest suite for the pure logic (no network)
 runs/
   <profile>/<timestamp>/   # intermediate JSON per run (raw/deduped/passed/blocked/scored) — git-ignored
 ```
@@ -187,5 +190,8 @@ Generalized for sharing (branch `feature/shareable-app`): any person is a new fo
 debugging. User-facing docs: `README.md` and `docs/google-sheet-setup.md`. Each user brings their
 own Google service account key (default `secrets/service-account.json`, override with
 `credentials:` in config) so sheets are isolated. Nothing in code or prompts may assume a country,
-industry or person. Known gaps: `status_sync_snapshot` lives in one AI_MetaData cell (breaks near
-~1,000 synced jobs, Sheets' 50k-character cell cap); `append_jobs` writes columns by position.
+industry or person. Feedback tracking lives in the agent-owned `AI_StatusSync` tab (Job ID, Status, Reason: what the
+learning step last read); older sheets' single-cell `status_sync_snapshot` is migrated into it
+once. Jobs rows are written by header name, so added columns never misalign. Development:
+`uv sync`, then `uv run pytest` and `uv run ruff check scripts tests`. Known gap: only LinkedIn
+is searched; other sources would plug in beside `fetch.py`.
