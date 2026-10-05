@@ -1,0 +1,14 @@
+[project]
+name = "job-search-agent"
+version = "0.2.0"
+description = "Finds new LinkedIn jobs that match your resume and adds them to your Google Sheet."
+requires-python = ">=3.10"
+dependencies = [
+    "python-jobspy>=1.1.80",
+    "gspread>=6.1.0",
+    "google-auth>=2.30.0",
+    "PyYAML>=6.0",
+]
+
+[tool.uv]
+package = false

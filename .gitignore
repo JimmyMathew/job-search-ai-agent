@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Google credentials stay local
+secrets/*
+!secrets/.gitkeep
+!secrets/README.md
+
+runs/
+
+.env
+
+# Every real person's profile (resume, profile.md, sheet address) stays local.
+# Only the fictional template is shared.
+profiles/*
+!profiles/_example/
+
+# Resumes and personal documents, wherever they end up
+*.pdf
+*.docx
+
+# Original design notes mention a specific person; keep local only
+LinkedIn Job Search Agent Plan.md

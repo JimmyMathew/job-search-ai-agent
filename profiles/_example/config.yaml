@@ -1,0 +1,33 @@
+# Your settings. Only two things are required: `locations` and `sheet`.
+# Everything else is optional. Lines starting with # are comments.
+
+# 1. WHERE to look for jobs. One or more places, in plain words. Any country works.
+#    Use "Remote" to search remote roles.
+locations:
+  - "YOUR CITY, COUNTRY"   # replace this, e.g. "Berlin, Germany" or "Austin, TX"
+  # - "Remote"
+
+# 2. YOUR GOOGLE SHEET: paste the web address from your browser's address bar.
+#    (Setup steps: docs/google-sheet-setup.md)
+sheet: "PASTE YOUR GOOGLE SHEET ADDRESS HERE"
+
+# 3. WHAT roles to search for (optional).
+#    Leave this empty and the AI reads your resume and suggests roles for you to approve
+#    when you run /job-setup. Or list the titles you want:
+roles: []
+#  - "Project Manager"
+#  - "Program Manager"
+
+# Also search related roles the AI thinks fit your resume? (true/false)
+explore_adjacent_roles: true
+
+# ---- Advanced: you can ignore everything below ----------------------------------------
+# Default cap on how many jobs the AI scores per run (this uses your Claude usage); you are asked before each run.
+# Every new job still lands in your sheet, scored or not.
+# max_jobs_to_score_per_run: 60
+
+# How many hours back to search on your very first run.
+# first_run_hours_old: 72
+
+# Where your Google service-account key lives (relative to the project folder).
+# credentials: secrets/service-account.json

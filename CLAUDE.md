@@ -1,0 +1,191 @@
+# LinkedIn Job Search Agent
+
+Finds every new LinkedIn job matching a person's resume, adds it to their Google Sheet once, and
+learns from their feedback. Manual trigger only (`/job-run <profile>`) — it never runs on a
+timer, so it never competes with other Claude usage. Full design rationale lives in
+`LinkedIn Job Search Agent Plan.md`; this file is the operational reference for actually running
+and extending it.
+
+## Who does what
+
+| Component | Tool | Why |
+| --- | --- | --- |
+| Orchestrator | Claude Code (this session, Opus recommended) | Judgment: sequencing, learning, checkpoints |
+| Scorer | `.claude/agents/job-scorer.md`, Sonnet subagent | Reads many jobs; cheap and fast |
+| Fetch / dedupe / prefilter / sheet I/O | `scripts/*.py` | Mechanical, zero tokens |
+
+Nothing person-specific lives in code. A new job seeker is a new folder under `profiles/`, not a
+code change.
+
+## Folder structure
+
+```
+CLAUDE.md
+.claude/
+  commands/job-run.md      # /job-run <profile> — the evening cycle
+  commands/job-setup.md    # /job-setup <profile> — onboard a person or refresh their profile.md
+  agents/job-scorer.md     # Sonnet subagent used by job-run's scoring step
+scripts/
+  util.py                  # shared helpers: config loading, job ID parsing, dedupe/repost logic
+  fetch.py                 # JobSpy LinkedIn search, one profile's keywords × locations
+  sheet.py                 # all Google Sheet reads/writes (gspread)
+  prefilter.py             # applies Block rules as keyword checks, no model involved
+  new_profile.py           # creates profiles/<name>/ from the profiles/_example template
+  doctor.py                # readiness checklist: packages, resume, config, Google key, sheet
+profiles/
+  _example/                # tracked template (fictional); everything else here is git-ignored
+  <name>/
+    <any>.pdf/.docx/.txt   # the resume, any file name; git-ignored — personal, stays local only
+    config.yaml            # locations, roles, sheet ID, limits — the person's decisions
+    profile.md             # written by /job-setup from the resume — what the scorer actually reads
+secrets/
+  service-account.json     # Google credentials — git-ignored, never commit this
+runs/
+  <profile>/<timestamp>/   # intermediate JSON per run (raw/deduped/passed/blocked/scored) — git-ignored
+```
+
+There is one sheet tab for job listings — **Jobs** — not split by score or by whether a rule
+blocked it. Every job that survives dedupe lands there, sorted by score, so nothing is hidden
+from the person just because the AI rated it low; score is a sort order and a one-line
+explanation, not a gate. See "Sheet design" below.
+
+## Running it
+
+```
+/job-run <profile>
+```
+
+Runs the full evening cycle end to end, stopping at a checkpoint right after dedupe (before any
+description fetching) so the person running it can cap how many jobs get scored. The exact steps
+are spelled out in `.claude/commands/job-run.md` — read that file rather than this summary if
+you're about to run or debug it, since it has the actual script invocations.
+
+In short: read the sheet → learn from any new feedback (only if there is any) → fetch new
+postings for every keyword in `profile.md` (listing only, cheap) → dedupe against everything
+already seen → checkpoint (caps how many get *scored*, not how many get written) → **write every
+deduped job to the sheet immediately, as "Pending" for the capped subset and its final state for
+the rest** → fetch full descriptions for just the capped subset (the expensive, blockable request)
+→ prefilter with Block rules → score the survivors in batches of 10 via the Sonnet subagent →
+update those same Pending rows in place with real results → update AI_MetaData → summarize.
+
+Jobs get written to the sheet *before* the slow description/scoring steps, not after — an earlier
+version wrote everything in one batch at the very end, which meant a crash or interruption during
+a 30+ minute run lost all visibility into work already done, even though nothing was actually
+lost on disk. Writing "Pending" rows immediately and updating them in place (`update_jobs()`,
+matched by Job ID) means the worst case is now "some rows still say Pending," never "nothing in
+the sheet at all." Fixed 2026-09-28, after exactly that scenario came up on a 484-job run.
+
+Fetching is deliberately two-phase — `fetch.py search` then `fetch.py descriptions` — because
+LinkedIn only returns full descriptions via a separate per-job request. Fetching them for every
+raw search result instead of just the deduped survivors was an early bug here (each keyword
+search took 90-140s instead of ~20s); see `scripts/fetch.py`'s module docstring.
+
+If a run is interrupted, nothing is lost and nothing is double-counted: `last_run_iso` in
+AI_MetaData is only updated after the sheet writes succeed, so an interrupted run's window gets
+picked up again next time.
+
+Onboarding a new person or refreshing an existing profile's `profile.md`:
+
+```
+/job-setup <profile-name>
+```
+
+## One-time setup (per new profile, or once for the whole repo)
+
+End-user steps live in `README.md` and `docs/google-sheet-setup.md`; run
+`python scripts/doctor.py --profile <name>` to verify. The list below is the maintainer view.
+
+1. Python 3.10+, then `pip install -r requirements.txt` (JobSpy, gspread, google-auth, PyYAML).
+2. Create a Google Cloud service account with the Sheets API enabled, download its JSON key to
+   `secrets/service-account.json` (git-ignored — never commit it).
+3. Create the person's Google Sheet, share it with the service account's `client_email` as
+   Editor, and put the sheet's ID into `profiles/<name>/config.yaml`.
+4. `python scripts/sheet.py --profile <name> init-tabs` — creates Jobs / AI_Rules / AI_MetaData
+   with headers if they don't exist yet, seeds the Preferences tab with example rows if it doesn't
+   exist yet (never touches it if it does — a job seeker's filled-in answers must never be
+   overwritten), and applies the Status dropdown (New / Interested / Applied / Not for me /
+   Rejected by company / Interview / Offer) to the Jobs tab via `apply_status_validation()`. The
+   "AI_" prefix on those two tabs is deliberate — Jobs and Preferences are the job seeker's tabs,
+   AI_Rules and AI_MetaData are the agent's own bookkeeping, and the prefix keeps that obvious at
+   a glance. Re-run `python scripts/sheet.py --profile <name> apply-status-validation` on its own
+   if the dropdown is ever missing or ends up on the wrong column (it clears stale validation
+   across the whole Jobs range first, so it's always safe to re-run after any column reorder).
+5. `python scripts/sheet.py --profile <name> test-write` — confirms the credentials and sharing
+   are correct (Phase 0's done-criterion: one row lands in AI_MetaData).
+6. `/job-setup <name>` to write `profile.md` from the resume, if that hasn't happened yet.
+
+## Sheet design
+
+Four tabs, one sheet per job seeker. The job seeker edits **Status** and **Reason** in Jobs, and
+**Value** in Preferences — nothing else is theirs to touch.
+
+- **Jobs** — every job that survives dedupe, whatever its score: scored high, scored low, or
+  blocked by a rule (score left blank, `Why it matches` holds the block/skip reason instead).
+  There is deliberately no second "Filtered" tab and no score threshold gating what gets written —
+  an earlier version of this design split jobs across two tabs by score, and hid low scorers in a
+  tab the job seeker might never check. That's a real risk for someone job-hunting: the AI's score
+  is a judgment call, not a guarantee, and a job scored 45 might still be worth applying to. Score
+  is now a sort order and a one-line explanation, never a gate. Columns, in sheet order: **Date
+  added, Score, Job ID, Job title, Company, Location, Posted, Link, Why it matches, Gaps, Flags,
+  Role type, Status, Reason.** Status is a dropdown (`apply_status_validation()`); everything else
+  is agent-written.
+- **AI_Rules** — plain-language learning rules (Rule, Type: Block/Lower/Boost, Keywords, Based on,
+  Added by, Active). The job seeker can edit or deactivate any rule by hand. The "AI_" prefix
+  marks this and AI_MetaData as the agent's tabs, distinct from Jobs and
+  Preferences which are the job seeker's.
+- **Preferences** — things the job seeker states directly about what they want, as simple
+  Criterion / Value / Example rows (e.g. minimum salary, career direction, industries to avoid).
+  Seeded once with example rows and a blank Value column (`ensure_preferences_seeded()`, never
+  re-run over existing data); a blank Value means no preference stated, and the scorer falls back
+  to profile.md / general judgment for that row. This exists instead of profile.md prose for
+  preference data specifically because it's the one thing meant to be edited directly by the job
+  seeker in Sheets, with zero technical vocabulary (no "type: hard requirement" style jargon —
+  just a question, a blank cell, and an example of what to write). See `PREFERENCES_SEED_ROWS` in
+  `scripts/sheet.py` for the exact starter questions.
+- **AI_MetaData** — key/value: `last_run_iso`, `jobs_seen_last_run`, `jobs_added_last_run`,
+  `reposts_skipped_last_run`, `linkedin_status` (ok/blocked/partial), and
+  `status_sync_snapshot` (a `{job_id: "status||reason"}` JSON blob — see below). Not for the job
+  seeker to read; it's run bookkeeping. Read/write via `scripts/sheet.py meta` / `update-meta`.
+
+**Why there's no second "Status changed" column next to Status in Jobs:** the learning step needs
+to know which rows' Status/Reason changed since it last looked, but that tracking doesn't have to
+live in the same tab the person edits — a second status-shaped column there reads as confusing
+(which one do I edit?). Instead `status_sync_snapshot` in AI_MetaData holds the last-seen
+Status+Reason per job ID; `get_changed_status_rows()` diffs live Jobs rows against that snapshot, and
+`mark_status_synced()` updates it after the learning step processes them. Jobs keeps exactly one
+status-shaped column.
+
+Exact column layouts are defined in `scripts/sheet.py` (`JOBS_HEADERS`, `RULES_HEADERS`,
+`PREFERENCES_HEADERS`) — that
+file is the source of truth if this doc and the code ever disagree.
+
+## Learning loop — guardrails that matter
+
+- A **Block** rule needs at least 2 similar "Not for me" rejections behind it — one bad day
+  shouldn't remove a whole category. Block rules are the only ones `prefilter.py` acts on
+  mechanically (keyword match on title + description); Lower/Boost are ranking hints the scorer
+  subagent applies with judgment.
+- The agent writes rules with `Added by: AI`. Rules with any other `Added by` value were written by a human and are never changed or removed by the agent.
+- Every run's summary lists rules added or changed, so a bad lesson is easy to spot and undo.
+
+## Token budget rules — don't relearn these, just follow them
+
+- Manual trigger only — never add a scheduled/cron run without being asked.
+- Fetch, dedupe, prefilter, and sheet I/O are Python; never do them by reasoning over data in the
+  main context.
+- Skip the learning step entirely when `changed-status` comes back empty.
+- Always stop at the checkpoint after prefiltering — never auto-score everything without asking.
+- Trim descriptions before they reach the scorer (`trim_description` in `scripts/util.py`, ~1500
+  words). Batch 10 jobs per `job-scorer` subagent call, not one call per job.
+
+## Current status
+
+Generalized for sharing (branch `feature/shareable-app`): any person is a new folder under
+`profiles/` created by `scripts/new_profile.py` from the `profiles/_example/` template; only
+`locations` and `sheet` are required in `config.yaml` (`roles` optional, AI-suggested at
+`/job-setup` when empty). `scripts/doctor.py` is the readiness checklist for onboarding and
+debugging. User-facing docs: `README.md` and `docs/google-sheet-setup.md`. Each user brings their
+own Google service account key (default `secrets/service-account.json`, override with
+`credentials:` in config) so sheets are isolated. Nothing in code or prompts may assume a country,
+industry or person. Known gaps: `status_sync_snapshot` lives in one AI_MetaData cell (breaks near
+~1,000 synced jobs, Sheets' 50k-character cell cap); `append_jobs` writes columns by position.
