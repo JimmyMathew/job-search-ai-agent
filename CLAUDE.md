@@ -2,9 +2,8 @@
 
 Finds every new LinkedIn job matching a person's resume, adds it to their Google Sheet once, and
 learns from their feedback. Manual trigger only (`/job-run <profile>`) — it never runs on a
-timer, so it never competes with other Claude usage. Full design rationale lives in
-`LinkedIn Job Search Agent Plan.md`; this file is the operational reference for actually running
-and extending it.
+timer, so it never competes with other Claude usage. This file is the operational reference
+for actually running and extending it; end-user setup is in `README.md`.
 
 ## Who does what
 
