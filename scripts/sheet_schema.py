@@ -44,6 +44,21 @@ TAB_HEADERS = {
     STATUS_SYNC_TAB: STATUS_SYNC_HEADERS,
 }
 
+SHEET_TITLE_PREFIX = "Job Search - "
+
+
+def sheet_title(profile: str) -> str:
+    """The title of the sheet the app creates; also how it finds that sheet again if the
+    local record of it is lost."""
+    return f"{SHEET_TITLE_PREFIX}{profile}"
+
+
+def default_tab_to_adopt(titles: list[str], first_tab_empty: bool) -> bool:
+    """True if a brand-new sheet's only tab is Google's empty default ("Sheet1" in the
+    person's language), which we rename to Jobs instead of leaving a stray empty tab."""
+    return len(titles) == 1 and titles[0] not in TAB_HEADERS and first_tab_empty
+
+
 STATUS_NEW = "New"
 STATUS_VALUES = [
     STATUS_NEW,

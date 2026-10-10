@@ -1,12 +1,17 @@
-# Google Sheet setup (about 15 minutes, once)
+# Advanced: use an existing sheet (service account)
 
-The agent writes your jobs into a Google Sheet that only you can see. To let it do that without
-you signing in each time, you create a small "robot" Google account called a **service account**.
-You then share your sheet with the robot, just like sharing with a friend. Nobody else, including
-whoever gave you this tool, can see your sheet.
+**Most people should skip this page.** The normal setup signs you in with your Google account and
+creates your sheet for you (see the README). Use this page only if you already have a Google Sheet
+you want the agent to fill, or you do not want to sign in through the browser. The app can only
+open sheets it created itself, so a hand-made sheet needs this "robot account" route.
+
+You create a small "robot" Google account called a **service account** and share your sheet with
+it, just like sharing with a friend. Nobody else can see your sheet. When you set `sheet:` in
+`config.yaml` and the key file below exists, the app uses this route automatically; you can also
+force it with `auth: service_account`.
 
 You will end up with one file, `service-account.json`. Treat it like a password: never share it,
-never upload it anywhere.
+never upload it anywhere. About 15 minutes, once.
 
 ## 1. Create a Google Cloud project
 
@@ -46,12 +51,13 @@ with a work account. Use a personal Google account.)
    (step 6); it prints it, or open `service-account.json` and copy the `client_email` value.
 3. Set the role to **Editor**, untick "Notify people", click **Share**.
 4. Copy the sheet's web address from your browser's address bar.
-5. Open `profiles/<your-name>/config.yaml` and paste it after `sheet:`.
+5. Open `profiles/<your-name>/config.yaml` and paste it after `sheet:` (and optionally add the
+   line `auth: service_account`).
 
 ## 6. Check everything
 
 ```
-python scripts/doctor.py --profile <your-name>
+uv run python scripts/doctor.py --profile <your-name>
 ```
 
 It prints OK or FIX for each item, with the exact fix for anything wrong. When everything is OK,

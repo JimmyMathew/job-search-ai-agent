@@ -5,6 +5,29 @@ learns from their feedback. Manual trigger only (`/job-run <profile>`) — it ne
 timer, so it never competes with other Claude usage. This file is the operational reference
 for actually running and extending it; end-user setup is in `README.md`.
 
+## Setup requests
+
+When the user asks to set up, get started, install, or "set me up", run the `/job-setup` command
+(`.claude/commands/job-setup.md`). It is one idempotent start-to-finish flow: install uv and the
+packages, find the resume (`resume/` drop folder), create the profile, ask for locations, sign in
+to Google and create the sheet, check with the doctor, write `profile.md`. Do not improvise your
+own setup steps, and never read anything under `secrets/`.
+
+**Auth modes** (`config.choose_auth`, per profile; `auth:` in `config.yaml` overrides):
+- `oauth` (default): the person signs in once in a browser (scope `drive.file`, so the app only
+  sees files it created). `python scripts/sheet.py --profile <name> connect` creates the sheet in
+  their own Drive and is idempotent. The app's OAuth client lives in
+  `scripts/google_oauth_client.json` (owner setup: `docs/maintainer-oauth-client.md`).
+- `service_account`: for an existing hand-made sheet (`drive.file` cannot open those). Chosen
+  automatically when `config.yaml` itself sets `sheet:` and `secrets/service-account.json` exists;
+  see `docs/service-account-setup.md`. Existing users such as `dubai-bil` stay on this.
+
+**State:** `profiles/<name>/agent-state.json` (git-ignored) remembers the sheet the app created
+(`sheet_id`, `sheet_url`, ...). A `sheet:` in `config.yaml` wins over it. If the file is lost,
+`connect` re-finds the sheet by its title `Job Search - <name>`. The Google sign-in token is
+`secrets/tokens/<name>.json`; only `google_auth.py login` and `sheet.py connect` ever open a
+browser, every other script fails with "Google sign-in needed" instead.
+
 ## Who does what
 
 | Component | Tool | Why |
@@ -22,7 +45,8 @@ code change.
 CLAUDE.md
 .claude/
   commands/job-run.md      # /job-run <profile> — the evening cycle
-  commands/job-setup.md    # /job-setup <profile> — onboard a person or refresh their profile.md
+  commands/job-setup.md    # /job-setup [profile] — whole setup, start to finish (also "set me up")
+  settings.json            # pre-approved script commands; denies reading secrets/
   agents/job-scorer.md     # Sonnet subagent used by job-run's scoring step
 scripts/
   config.py                # profiles + config.yaml: locate, load, default, validate
@@ -30,18 +54,24 @@ scripts/
   fetch.py                 # JobSpy LinkedIn search, one profile's keywords × locations
   pipeline.py              # plan, batch, ingest scores, recover after a crash (the middle of /job-run)
   sheet_schema.py          # sheet layout (tabs, headers, seed rows) + pure row/diff logic
-  sheet.py                 # all Google Sheet reads/writes (gspread) + CLI
+  sheet.py                 # all Google Sheet reads/writes (gspread) + CLI; `connect` creates the sheet
+  google_auth.py           # Google OAuth sign-in (drive.file), token refresh; login/status/logout CLI
   prefilter.py             # applies Block rules as keyword checks, no model involved
   new_profile.py           # creates profiles/<name>/ from the profiles/_example template
-  doctor.py                # readiness checklist: packages, resume, config, Google key, sheet
+  doctor.py                # readiness checklist: packages, resume, config, Google sign-in, sheet
+  google_oauth_client.json # the app's OAuth desktop client (owner adds it; see docs/maintainer-oauth-client.md)
 profiles/
   _example/                # tracked template (fictional); everything else here is git-ignored
   <name>/
     <any>.pdf/.docx/.txt   # the resume, any file name; git-ignored — personal, stays local only
-    config.yaml            # locations, roles, sheet ID, limits — the person's decisions
+    config.yaml            # locations, roles, limits — the person's decisions (sheet: only for existing sheets)
+    agent-state.json       # written by the app: the sheet it created; git-ignored
     profile.md             # written by /job-setup from the resume — what the scorer actually reads
+resume/                    # drop folder for the resume (contents git-ignored; README.txt tracked)
 secrets/
-  service-account.json     # Google credentials — git-ignored, never commit this
+  tokens/<profile>.json    # Google sign-in tokens — git-ignored
+  service-account.json     # only for the advanced existing-sheet option — git-ignored
+docs/                      # service-account-setup.md (advanced), maintainer-oauth-client.md (owner)
 tests/                     # pytest suite for the pure logic (no network)
 runs/
   <profile>/<timestamp>/   # intermediate JSON per run (raw/deduped/passed/blocked/scored) — git-ignored
@@ -96,29 +126,29 @@ Onboarding a new person or refreshing an existing profile's `profile.md`:
 /job-setup <profile-name>
 ```
 
-## One-time setup (per new profile, or once for the whole repo)
+## Setup (maintainer view)
 
-End-user steps live in `README.md` and `docs/google-sheet-setup.md`; run
-`python scripts/doctor.py --profile <name>` to verify. The list below is the maintainer view.
+End users just say "set me up" (see "Setup requests"). Underneath it is:
 
-1. Python 3.10+, then `pip install -r requirements.txt` (JobSpy, gspread, google-auth, PyYAML).
-2. Create a Google Cloud service account with the Sheets API enabled, download its JSON key to
-   `secrets/service-account.json` (git-ignored — never commit it).
-3. Create the person's Google Sheet, share it with the service account's `client_email` as
-   Editor, and put the sheet's ID into `profiles/<name>/config.yaml`.
-4. `python scripts/sheet.py --profile <name> init-tabs` — creates Jobs / AI_Rules / AI_MetaData
-   with headers if they don't exist yet, seeds the Preferences tab with example rows if it doesn't
-   exist yet (never touches it if it does — a job seeker's filled-in answers must never be
-   overwritten), and applies the Status dropdown (New / Interested / Applied / Not for me /
-   Rejected by company / Interview / Offer) to the Jobs tab via `apply_status_validation()`. The
-   "AI_" prefix on those two tabs is deliberate — Jobs and Preferences are the job seeker's tabs,
-   AI_Rules and AI_MetaData are the agent's own bookkeeping, and the prefix keeps that obvious at
-   a glance. Re-run `python scripts/sheet.py --profile <name> apply-status-validation` on its own
-   if the dropdown is ever missing or ends up on the wrong column (it clears stale validation
-   across the whole Jobs range first, so it's always safe to re-run after any column reorder).
-5. `python scripts/sheet.py --profile <name> test-write` — confirms the credentials and sharing
-   are correct (Phase 0's done-criterion: one row lands in AI_MetaData).
-6. `/job-setup <name>` to write `profile.md` from the resume, if that hasn't happened yet.
+1. `uv sync` (or Python 3.10+ and `pip install -r requirements.txt`).
+2. `python scripts/new_profile.py <name> --resume <file>`, then set `locations` in the profile's
+   `config.yaml`.
+3. `python scripts/sheet.py --profile <name> connect`: Google sign-in, creates or re-finds the
+   sheet, then `init-tabs` (below) and a test write. Existing-sheet users instead follow
+   `docs/service-account-setup.md` and run `init-tabs` (the doctor also creates missing tabs).
+4. `python scripts/doctor.py --profile <name>` must show no FIX; then `/job-setup` writes
+   `profile.md` from the resume.
+
+`init-tabs` creates Jobs / AI_Rules / AI_MetaData
+with headers if they don't exist yet, seeds the Preferences tab with example rows if it doesn't
+exist yet (never touches it if it does — a job seeker's filled-in answers must never be
+overwritten), and applies the Status dropdown (New / Interested / Applied / Not for me /
+Rejected by company / Interview / Offer) to the Jobs tab via `apply_status_validation()`. The
+"AI_" prefix on those two tabs is deliberate — Jobs and Preferences are the job seeker's tabs,
+AI_Rules and AI_MetaData are the agent's own bookkeeping, and the prefix keeps that obvious at
+a glance. Re-run `python scripts/sheet.py --profile <name> apply-status-validation` on its own
+if the dropdown is ever missing or ends up on the wrong column (it clears stale validation
+across the whole Jobs range first, so it's always safe to re-run after any column reorder).
 
 ## Sheet design
 
@@ -199,9 +229,10 @@ Generalized for sharing (branch `feature/shareable-app`): any person is a new fo
 `profiles/` created by `scripts/new_profile.py` from the `profiles/_example/` template; only
 `locations` and `sheet` are required in `config.yaml` (`roles` optional, AI-suggested at
 `/job-setup` when empty). `scripts/doctor.py` is the readiness checklist for onboarding and
-debugging. User-facing docs: `README.md` and `docs/google-sheet-setup.md`. Each user brings their
-own Google service account key (default `secrets/service-account.json`, override with
-`credentials:` in config) so sheets are isolated. Nothing in code or prompts may assume a country,
+debugging. User-facing docs: `README.md` (and `docs/service-account-setup.md` for the advanced
+existing-sheet option). Each user signs in with their own Google account and the app creates the
+sheet in their own Drive (OAuth, `drive.file`), so sheets are isolated; service-account keys
+(`credentials:` in config) remain for existing sheets. Nothing in code or prompts may assume a country,
 industry or person. Feedback tracking lives in the agent-owned `AI_StatusSync` tab (Job ID, Status, Reason: what the
 learning step last read); older sheets' single-cell `status_sync_snapshot` is migrated into it
 once. Jobs rows are written by header name, so added columns never misalign. Development:

@@ -1,4 +1,4 @@
 Drop your resume in this folder. Any file name works; PDF, DOCX or TXT.
-Then edit config.yaml (your locations and Google Sheet address), and run /job-setup in Claude Code.
+Then edit config.yaml (your locations), and run /job-setup in Claude Code.
 
 (Delete this file if you like. It is only a reminder.)

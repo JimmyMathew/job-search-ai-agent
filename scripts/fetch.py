@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from config import ProfileError, load_config, load_profile_md
-from util import extract_job_id, load_json, now_iso, save_json, unwrap_jobs
+from util import extract_job_id, load_json, now_iso, run_cli, save_json, unwrap_jobs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("fetch")
@@ -309,4 +309,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_cli(main)

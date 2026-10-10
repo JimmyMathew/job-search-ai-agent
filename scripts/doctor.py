@@ -9,17 +9,26 @@ Prints OK / WARN / FIX per check. Exits 1 if anything needs fixing.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import importlib
 import json
 import sys
 
-from config import ProfileError, credentials_path, find_resume, load_config, profile_dir
+from config import (
+    PROFILES_DIR,
+    ProfileError,
+    choose_auth,
+    credentials_path,
+    find_resume,
+    load_config,
+    oauth_client_path,
+    profile_dir,
+)
 
 REQUIRED_PACKAGES = {
     "jobspy": "python-jobspy",
     "gspread": "gspread",
     "google.auth": "google-auth",
+    "google_auth_oauthlib": "google-auth-oauthlib",
     "yaml": "PyYAML",
 }
 
@@ -33,6 +42,93 @@ def report(level: str, message: str, fix: str = "") -> None:
     print(f"[{level:>4}] {message}")
     for line in fix.splitlines():
         print(f"         {line}")
+
+
+def check_service_account_key(key_path) -> str | None:
+    """Report on the service-account key; returns its client_email if it is usable."""
+    if not key_path.exists():
+        report(
+            "FIX",
+            f"Google key not found at {key_path}",
+            "Follow docs/service-account-setup.md (steps 1-4) and save the key there.",
+        )
+        return None
+    try:
+        client_email = json.loads(key_path.read_text(encoding="utf-8"))["client_email"]
+    except (ValueError, KeyError):
+        report(
+            "FIX",
+            f"{key_path.name} is not a valid service-account key",
+            "Re-download the JSON key (docs/service-account-setup.md, step 4).",
+        )
+        return None
+    report("OK", f"Google key found. Share your sheet (as Editor) with:\n{client_email}")
+    return client_email
+
+
+def check_oauth_ready(profile: str, config: dict) -> bool:
+    """Report on the app's OAuth client, the person's sign-in and their sheet. True when a
+    sheet is known and the person is signed in, so it can be opened."""
+    from google_auth import NetworkProblem, SignInNeeded, get_credentials
+
+    connect_cmd = f"Run: uv run python scripts/sheet.py --profile {profile} connect"
+    # The app's client file is only needed to open the browser sign-in. A saved sign-in keeps
+    # working without it, so a missing file is a problem only when signing in is needed.
+    try:
+        get_credentials(profile)
+        report("OK", "Signed in to Google")
+        signed_in = True
+    except NetworkProblem as exc:
+        report("FIX", str(exc))
+        return False
+    except SignInNeeded:
+        signed_in = False
+        if oauth_client_path().exists():
+            report("FIX", "Not signed in to Google yet", f"{connect_cmd}\n(it opens a browser tab)")
+        else:
+            report(
+                "FIX",
+                "Google sign-in isn't available in this copy of the app "
+                f"({oauth_client_path().name} is missing)",
+                "The project owner has to add it: see docs/maintainer-oauth-client.md",
+            )
+            return False
+    if not config.get("sheet_id"):
+        report("FIX", "No Google Sheet yet", connect_cmd)
+        return False
+    report("OK", f"Sheet: https://docs.google.com/spreadsheets/d/{config['sheet_id']}/edit")
+    return signed_in
+
+
+def check_sheet(profile: str, access_hint: str) -> None:
+    """Open the sheet and make sure every tab exists (creating missing ones)."""
+    try:
+        from sheet import SheetClient
+        from sheet_schema import TAB_HEADERS
+
+        client = SheetClient(profile)
+        report("OK", f"Sheet opens: {client.spreadsheet.title!r}")
+        existing = {ws.title for ws in client.spreadsheet.worksheets()}
+        needed = set(TAB_HEADERS)
+        if needed - existing:
+            client.init_tabs()  # only touches the sheet when a tab is missing
+            report("OK", "Created the missing tabs: " + ", ".join(sorted(needed - existing)))
+        else:
+            report("OK", "Tabs ready: " + ", ".join(TAB_HEADERS))
+    except Exception as exc:  # gspread raises several unrelated types
+        name, text = type(exc).__name__, str(exc)
+        if "SpreadsheetNotFound" in name or "404" in text:
+            report(
+                "FIX",
+                "Can't find the sheet",
+                access_hint
+                or "Was it deleted? Run `sheet.py --profile "
+                f"{profile} connect` to look for it again.",
+            )
+        elif "403" in text or "PERMISSION" in text.upper():
+            report("FIX", "Google refused access", access_hint or "Try signing in again.")
+        else:
+            report("FIX", f"Couldn't open the sheet: {name}: {text}")
 
 
 def main() -> None:
@@ -75,82 +171,41 @@ def main() -> None:
 
     resume = find_resume(profile)
     if resume:
-        report("OK", f"Resume found: {resume.name}")
+        report("OK", f"Resume found: {resume.resolve()}")
     else:
         report(
             "FIX",
             "No resume in your profile folder",
-            f"Drop your resume (PDF, DOCX or TXT) into profiles/{profile}/",
+            f"Drop your resume (PDF, DOCX or TXT) into {(PROFILES_DIR / profile).resolve()}",
         )
 
-    config = partial = None
+    config = None
     if "PyYAML" in missing:
         report("WARN", "Skipping config check until packages are installed")
     else:
         try:
-            config = partial = load_config(profile)
-            report("OK", f"config.yaml: {len(config['locations'])} location(s), sheet set")
+            config = load_config(profile)
+            report("OK", f"config.yaml: {len(config['locations'])} location(s)")
         except ProfileError as exc:
             report("FIX", str(exc))
-            with contextlib.suppress(ProfileError):
-                partial = load_config(profile, require_sheet=False)
 
     if (profile_dir(profile) / "profile.md").exists():
         report("OK", "profile.md exists")
     else:
         report("WARN", "profile.md not written yet", f"In Claude Code, run: /job-setup {profile}")
 
-    key_path = credentials_path(partial or {})
-    client_email = None
-    if not key_path.exists():
-        report(
-            "FIX",
-            f"Google key not found at {key_path}",
-            "Follow docs/google-sheet-setup.md (steps 1-4) and save the key there.",
-        )
-    else:
-        try:
-            client_email = json.loads(key_path.read_text(encoding="utf-8"))["client_email"]
-            report("OK", f"Google key found. Share your sheet (as Editor) with:\n{client_email}")
-        except (ValueError, KeyError):
-            report(
-                "FIX",
-                f"{key_path.name} is not a valid service-account key",
-                "Re-download the JSON key (docs/google-sheet-setup.md, step 4).",
-            )
-
-    if config and client_email and not missing:
-        try:
-            from sheet import SheetClient
-            from sheet_schema import TAB_HEADERS
-
-            client = SheetClient(profile)
-            report("OK", f"Sheet opens: {client.spreadsheet.title!r}")
-            existing = {ws.title for ws in client.spreadsheet.worksheets()}
-            needed = set(TAB_HEADERS)
-            if needed - existing:
-                client.init_tabs()  # only touches the sheet when a tab is missing
-                report("OK", "Created the missing tabs: " + ", ".join(sorted(needed - existing)))
-            else:
-                report("OK", "Tabs ready: " + ", ".join(TAB_HEADERS))
-        except Exception as exc:  # gspread raises several unrelated types
-            name, text = type(exc).__name__, str(exc)
-            if "SpreadsheetNotFound" in name or "404" in text:
-                report(
-                    "FIX",
-                    "Can't find the sheet",
-                    f"Check the address in config.yaml, and share the sheet with "
-                    f"{client_email} as Editor.",
-                )
-            elif "403" in text or "PERMISSION" in text.upper():
-                report(
-                    "FIX",
-                    "Google refused access",
-                    f"Share the sheet with {client_email} as Editor, and make sure the "
-                    f"Google Sheets API is enabled (guide, step 2).",
-                )
-            else:
-                report("FIX", f"Couldn't open the sheet: {name}: {text}")
+    if config and not missing:
+        key_path = credentials_path(config)
+        mode = choose_auth(config, key_path.exists())
+        if mode == "service_account":
+            report("OK", "Google access: service-account key (existing sheet)")
+            client_email = check_service_account_key(key_path)
+            if client_email:
+                check_sheet(profile, f"Share the sheet with {client_email} as Editor.")
+        else:
+            report("OK", "Google access: sign in with your Google account")
+            if check_oauth_ready(profile, config):
+                check_sheet(profile, "")
 
     if args.online and not missing and config:
         try:

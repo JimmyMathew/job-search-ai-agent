@@ -9,31 +9,39 @@ It works anywhere LinkedIn has jobs; nothing is tied to a country or industry.
 ## What you need
 
 - A computer (Windows, Mac or Linux) on your normal home internet connection
-- [Claude Code](https://claude.com/claude-code) with a Claude subscription (it uses your own usage)
+- [VS Code](https://code.visualstudio.com/) with the [Claude Code](https://claude.com/claude-code)
+  extension, and a Claude subscription (it uses your own usage)
 - A Google account
-- About 15 minutes for the first setup
+- About 10 minutes for the first setup
 
 ## Quickstart
 
-1. **Install** [uv](https://docs.astral.sh/uv/) (installs Python and the packages for you), then in
-   this folder run: `uv sync`
-   (Prefer plain Python 3.10+? Run `pip install -r requirements.txt` instead.)
-2. **Create your folder:** `uv run scripts/new_profile.py your-name`
-3. **Drop your resume** (PDF, DOCX or TXT, any file name) into `profiles/your-name/`.
-4. **Edit `profiles/your-name/config.yaml`.** You only need to set:
-   - `locations`: where to search, e.g. `"Berlin, Germany"`, `"Austin, TX"`, `"Remote"`
-   - `roles` *(optional)*: job titles you want. Leave it empty and the AI will suggest roles from
-     your resume for you to approve.
-5. **Set up Google** by following [docs/google-sheet-setup.md](docs/google-sheet-setup.md), then
-   paste your sheet's address into `config.yaml` as `sheet:`.
-6. **Check it all:** `uv run scripts/doctor.py --profile your-name`. It tells you exactly what to
-   fix.
-7. **Open Claude Code in this folder** and run `/job-setup your-name`. The AI reads your resume,
-   proposes your roles and search keywords, and asks you to approve them.
-8. **Run it:** `/job-run your-name`. It finds new jobs, shows you how many it found, and asks how
-   many to score (to protect your usage). Then it fills your sheet.
+1. **Download** this project (green **Code** button on GitHub, then **Download ZIP**, and unzip
+   it somewhere you will find it again).
+2. **Put your resume** (PDF, Word or text, any file name) in the `resume` folder inside it.
+3. **Open the folder in VS Code**, open Claude Code, and say: **set me up**.
 
-Run `/job-run your-name` whenever you want fresh jobs. Only new jobs are ever added.
+Claude does the rest and asks you a couple of plain questions along the way: which city you want
+jobs in, and whether the roles it suggests from your resume look right. It installs what it needs
+(the free tool [uv](https://docs.astral.sh/uv/)), creates your Google Sheet, and writes a profile
+from your resume.
+
+### What you will see at Google sign-in
+
+A browser tab opens once. Pick your Google account and click **Continue** (or **Allow**). The app
+asks only for permission to see and edit **files it creates itself**, which is the one sheet it
+makes for you. It cannot see anything else in your Google Drive. When the tab says "Signed in",
+close it and go back to VS Code. Your sheet is created in your own Drive and its address is shown
+to you.
+
+### Then, every time you want fresh jobs
+
+Say `/job-run your-name` in Claude Code. It finds new jobs, shows you how many it found, and asks
+how many to score (to protect your usage). Then it fills your sheet. Only new jobs are ever added.
+
+*Advanced:* already have a Google Sheet you want to use, or would rather not sign in through the
+browser? Set `sheet:` in `profiles/your-name/config.yaml` and follow
+[docs/service-account-setup.md](docs/service-account-setup.md).
 
 ## Using your sheet
 
@@ -62,23 +70,26 @@ You can edit or turn off any rule in the AI_Rules tab.
 
 ## Several people, one computer
 
-Each person gets their own folder under `profiles/` and their own sheet, resume and Google key;
-nothing is shared. Run `/job-run <name>` for whichever profile you want.
+Each person gets their own folder under `profiles/` and their own sheet, resume and Google
+sign-in; nothing is shared. Run `/job-run <name>` for whichever profile you want.
 
 ## Troubleshooting
 
-Run `uv run scripts/doctor.py --profile your-name` first; it explains most problems.
+Run `uv run python scripts/doctor.py --profile your-name` first; it explains most problems.
 
 | Problem | What to do |
 | --- | --- |
-| Sheet errors (404, 403) | [docs/google-sheet-setup.md](docs/google-sheet-setup.md), troubleshooting table |
+| "Google sign-in needed" | Say "set me up" again, or run `uv run python scripts/sheet.py --profile your-name connect`. It is safe to repeat and never makes a second sheet |
+| Sheet errors (404, 403) with your own sheet | [docs/service-account-setup.md](docs/service-account-setup.md), troubleshooting table |
 | "Blocked" / zero jobs found | LinkedIn rate-limited you. Wait a few hours; avoid VPNs and work networks |
 | Rows stuck on "Pending" | A run was interrupted. Just run `/job-run your-name` again; it finishes the Pending rows first |
 | Missing packages | `uv sync` (or `pip install -r requirements.txt`) |
 
 ## Your data and privacy
 
-Your resume, profile and sheet stay on your computer and in your Google account. To score jobs,
+Your resume and profile stay on your computer, and your sheet lives in your own Google account.
+The Google sign-in is saved on your computer only, in `secrets/tokens/`. You can remove the app's
+access any time at <https://myaccount.google.com/permissions>. To score jobs,
 the text of your profile and of each job posting is processed by Claude (through Claude Code).
 Everything under `profiles/` (except the `_example` template) and `secrets/` is git-ignored, so
 it will not be uploaded if you use git.
@@ -96,9 +107,12 @@ work network, or on a server. Provided as-is under the [MIT License](LICENSE).
 uv sync                                  # installs dependencies plus pytest and ruff
 uv run pytest                            # unit tests (no network, no Google account needed)
 uv run ruff check scripts tests          # lint
+uv run ruff format --check scripts tests
 ```
 
 Code map: `scripts/config.py` (profiles and config), `scripts/sheet_schema.py` (sheet layout and
 pure logic), `scripts/sheet.py` (Google Sheets I/O), `scripts/fetch.py` (LinkedIn search),
-`scripts/prefilter.py` (rule-based filtering), `scripts/doctor.py` (setup checks). Design notes
-and conventions are in `CLAUDE.md`.
+`scripts/google_auth.py` (Google sign-in), `scripts/prefilter.py` (rule-based filtering),
+`scripts/doctor.py` (setup checks). Design notes and conventions are in `CLAUDE.md`. Maintainers:
+the one-time Google Cloud setup behind the sign-in is in
+[docs/maintainer-oauth-client.md](docs/maintainer-oauth-client.md).

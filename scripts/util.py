@@ -5,13 +5,23 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from config import RUNS_DIR
+from config import RUNS_DIR, UserFacingError
 
 _JOB_ID_RE = re.compile(r"/jobs/view/(\d+)")
+
+
+def run_cli(main: Callable[[], None]) -> None:
+    """Run a script's main(); a UserFacingError ends it with its plain message, not a traceback."""
+    try:
+        main()
+    except UserFacingError as exc:
+        sys.exit(str(exc))
 
 
 def extract_job_id(url: str) -> str | None:

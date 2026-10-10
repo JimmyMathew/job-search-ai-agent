@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import sys
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -34,7 +33,7 @@ from sheet_schema import (
     WHY_SCORING_FAILED,
     parse_scores,
 )
-from util import load_json, new_run_dir, save_json, trim_description, unwrap_jobs
+from util import load_json, new_run_dir, run_cli, save_json, trim_description, unwrap_jobs
 
 BATCH_SIZE = 10
 WRAP_WIDTH = 100  # the Read tool can truncate very long lines, so descriptions are wrapped
@@ -136,6 +135,17 @@ def context_markdown(rules: list[dict[str, Any]], prefs: list[dict[str, Any]]) -
     if not prefs:
         lines.append("(none stated)")
     return "\n".join(lines) + "\n"
+
+
+def split_scorable(
+    jobs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(jobs with a description to score, jobs whose description could not be fetched)."""
+    scorable, unavailable = [], []
+    for job in jobs:
+        has_text = job.get("description") and not job.get("description_unavailable")
+        (scorable if has_text else unavailable).append(job)
+    return scorable, unavailable
 
 
 def next_batch(state: dict[str, Any]) -> dict[str, Any] | None:
@@ -257,10 +267,7 @@ def cmd_make_batches(args: argparse.Namespace) -> None:
 
     config = load_config(args.profile)
     all_jobs = unwrap_jobs(load_json(args.jobs))
-    scorable = [
-        j for j in all_jobs if j.get("description") and not j.get("description_unavailable")
-    ]
-    unavailable = [j for j in all_jobs if j not in scorable]
+    scorable, unavailable = split_scorable(all_jobs)
 
     run_dir = args.run_dir
     rules = _load_optional(args.rules, [])
@@ -451,4 +458,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run_cli(main)

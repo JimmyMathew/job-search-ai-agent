@@ -1,6 +1,7 @@
 """All Google Sheet reads and writes for one profile's sheet.
 
 CLI (each subcommand prints a short result, or reads/writes JSON files):
+    python scripts/sheet.py --profile <name> connect        # sign in, create/find the sheet
     python scripts/sheet.py --profile <name> init-tabs
     python scripts/sheet.py --profile <name> test-write
     python scripts/sheet.py --profile <name> meta
@@ -19,7 +20,14 @@ CLI (each subcommand prints a short result, or reads/writes JSON files):
 One tab holds every job the agent has ever seen for this profile: scored high, scored
 low, or blocked by a rule. Nothing is hidden in a second tab. The person only edits
 Status and Reason; everything else is agent-written. The layout and pure logic live in
-sheet_schema.py. Auth is a Google service account key; see docs/google-sheet-setup.md.
+sheet_schema.py.
+
+Two ways to authenticate (config.choose_auth picks one per profile):
+  oauth            the person signs in to Google once; `connect` creates their sheet in their own
+                   Drive (drive.file scope) and remembers it in profiles/<name>/agent-state.json.
+  service_account  an existing sheet shared with a service-account key (advanced; see
+                   docs/service-account-setup.md). The original behaviour, unchanged.
+`connect` is idempotent and the only command here that may open a browser.
 """
 
 from __future__ import annotations
@@ -29,7 +37,15 @@ import json
 from pathlib import Path
 from typing import Any
 
-from config import credentials_path, load_config
+from config import (
+    ProfileError,
+    choose_auth,
+    credentials_path,
+    load_config,
+    read_state,
+    write_state,
+)
+from google_auth import get_credentials
 from sheet_schema import (
     JOBS_TAB,
     LEGACY_STATUS_SNAPSHOT_KEY,
@@ -41,14 +57,17 @@ from sheet_schema import (
     STATUS_SYNC_TAB,
     STATUS_VALUES,
     TAB_HEADERS,
+    default_tab_to_adopt,
     find_changed_status_rows,
     job_to_row,
     needs_scoring,
+    sheet_title,
     snapshot_entry,
 )
-from util import is_repost, load_json, now_iso, save_json, unwrap_jobs
+from util import is_repost, load_json, now_iso, run_cli, save_json, unwrap_jobs
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SHEET_URL = "https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
 REPOST_WINDOW_DAYS = 30
 AGENT_RULE_AUTHOR = "AI"  # rules with any other "Added by" were written by a human
 
@@ -58,23 +77,154 @@ class SheetClient:
         self.profile = profile
         self.config = load_config(profile)
         self._spreadsheet = None
+        self._gc = None
+
+    @property
+    def auth_mode(self) -> str:
+        return choose_auth(self.config, credentials_path(self.config).exists())
+
+    def _gspread_client(self, interactive: bool = False):
+        """The gspread client for this profile's auth mode. Only `interactive` may open a
+        browser for Google sign-in."""
+        if self._gc is None:
+            import gspread
+
+            if self.auth_mode == "service_account":
+                from google.oauth2.service_account import Credentials
+
+                key_path = credentials_path(self.config)
+                if not key_path.exists():
+                    raise ProfileError(
+                        f"Missing {key_path}. Create a Google service account, download its "
+                        f"JSON key there, and share the sheet with its client_email as Editor. "
+                        f"Step-by-step: docs/service-account-setup.md"
+                    )
+                creds = Credentials.from_service_account_file(str(key_path), scopes=SCOPES)
+            else:
+                if self.config["auth"] == "auto" and self.config.get("sheet_from_yaml"):
+                    raise ProfileError(
+                        "config.yaml has a `sheet:` address, but without a Google service-account "
+                        "key the app can only open sheets it created itself. Either delete the "
+                        "`sheet:` line (setup will then create a new sheet for you), or add a "
+                        "key: docs/service-account-setup.md"
+                    )
+                creds = get_credentials(self.profile, interactive=interactive)
+            self._gc = gspread.authorize(creds)
+        return self._gc
 
     @property
     def spreadsheet(self):
         if self._spreadsheet is None:
-            import gspread
-            from google.oauth2.service_account import Credentials
-
-            key_path = credentials_path(self.config)
-            if not key_path.exists():
-                raise RuntimeError(
-                    f"Missing {key_path}. Create a Google service account, download its "
-                    f"JSON key there, and share the sheet with its client_email as Editor. "
-                    f"Step-by-step: docs/google-sheet-setup.md"
+            if not self.config.get("sheet_id"):
+                raise ProfileError(
+                    "No sheet yet: run "
+                    f"`uv run python scripts/sheet.py --profile {self.profile} connect`"
                 )
-            creds = Credentials.from_service_account_file(str(key_path), scopes=SCOPES)
-            self._spreadsheet = gspread.authorize(creds).open_by_key(self.config["sheet_id"])
+            gc = self._gspread_client()
+            self._spreadsheet = gc.open_by_key(self.config["sheet_id"])
         return self._spreadsheet
+
+    # ---- Connecting ---------------------------------------------------------
+
+    def connect(self, interactive: bool = True) -> str:
+        """Make sure this profile has a working sheet with all its tabs; return its URL.
+
+        Safe to run any number of times. With OAuth it signs in if needed, then reuses the
+        sheet already known, or adopts one it created earlier (a crash between creating the
+        sheet and saving its ID would otherwise leave an orphan), or creates a new one."""
+        gc = self._gspread_client(interactive)
+        fresh = False
+        if not self.config.get("sheet_id"):
+            if self.auth_mode == "service_account":
+                raise ProfileError(
+                    "`auth: service_account` needs your sheet's address as `sheet:` in "
+                    "config.yaml (docs/service-account-setup.md)."
+                )
+            self._adopt_or_create_sheet(gc)
+            fresh = True
+        if self.auth_mode == "oauth":
+            self._adopt_default_tab()
+        self.init_tabs()
+        if fresh:
+            self.test_write()
+        return SHEET_URL.format(sheet_id=self.config["sheet_id"])
+
+    def _adopt_or_create_sheet(self, gc) -> None:
+        """Find or create this profile's sheet and remember it."""
+        title = sheet_title(self.profile)
+        own = self._find_own_sheet(gc, title)
+        if own is not None:
+            self._spreadsheet = own
+        else:
+            self._spreadsheet = gc.create(title)
+        sheet_id = self._spreadsheet.id
+        # Record the ID before doing anything else with the sheet. Merge, so nothing else
+        # kept in the state file is lost, and keep the original creation time if we have it.
+        previous = read_state(self.profile)
+        write_state(
+            self.profile,
+            {
+                **previous,
+                "sheet_id": sheet_id,
+                "sheet_url": SHEET_URL.format(sheet_id=sheet_id),
+                "sheet_title": title,
+                "created_at": previous.get("created_at") or now_iso(),
+                "auth": "oauth",
+            },
+        )
+        self.config["sheet_id"] = sheet_id
+
+    def _find_own_sheet(self, gc, title: str):
+        """A sheet this app made earlier (its state file was lost), or None.
+
+        Same title is not enough: Drive's listing includes trashed files and can include an
+        unrelated sheet someone happened to name the same. A candidate has to be out of the
+        trash and look like ours (has our Jobs tab, or is still the untouched default tab of
+        a sheet whose setup was interrupted). The most recently modified such sheet wins."""
+        matches = sorted(
+            gc.list_spreadsheet_files(title=title),
+            key=lambda f: f.get("modifiedTime", ""),
+            reverse=True,
+        )
+        for match in matches:
+            if self._is_trashed(gc, match["id"]):
+                continue
+            candidate = gc.open_by_key(match["id"])
+            worksheets = candidate.worksheets()
+            first_empty = len(worksheets) == 1 and not any(
+                cell for row in worksheets[0].get_all_values() for cell in row
+            )
+            if JOBS_TAB in {ws.title for ws in worksheets} or default_tab_to_adopt(
+                [ws.title for ws in worksheets], first_empty
+            ):
+                return candidate
+        return None
+
+    @staticmethod
+    def _is_trashed(gc, file_id: str) -> bool:
+        """Whether Drive has this file in the trash (False if that can't be determined)."""
+        try:
+            response = gc.http_client.request(
+                "get",
+                f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                params={"fields": "trashed"},
+            )
+            return bool(response.json().get("trashed"))
+        except Exception:  # a failed lookup must not stop setup; treat as not trashed
+            return False
+
+    def _adopt_default_tab(self) -> None:
+        """Turn Google's empty default tab into Jobs, so no stray empty tab is left behind."""
+        sheet = self.spreadsheet
+        worksheets = sheet.worksheets()
+        if len(worksheets) != 1:
+            return
+        first = worksheets[0]
+        empty = not any(cell for row in first.get_all_values() for cell in row)
+        if default_tab_to_adopt([ws.title for ws in worksheets], empty):
+            first.update_title(JOBS_TAB)
+            first.append_row(TAB_HEADERS[JOBS_TAB])
+            first.freeze(rows=1)
 
     # ---- Tabs ---------------------------------------------------------------
 
@@ -407,7 +557,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", required=True)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("init-tabs", "test-write", "meta", "apply-status-validation"):
+    for name in ("connect", "init-tabs", "test-write", "meta", "apply-status-validation"):
         sub.add_parser(name)
 
     for name in ("rules", "preferences", "changed-status", "pending"):
@@ -432,7 +582,9 @@ def main() -> None:
     client = SheetClient(args.profile)
     command = args.command
 
-    if command == "init-tabs":
+    if command == "connect":
+        print(f"SHEET_URL: {client.connect(interactive=True)}")
+    elif command == "init-tabs":
         client.init_tabs()
         print("Tabs ready: Jobs, Preferences, AI_Rules, AI_MetaData, AI_StatusSync")
     elif command == "test-write":
@@ -482,4 +634,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_cli(main)

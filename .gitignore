@@ -6,6 +6,11 @@ __pycache__/
 secrets/*
 !secrets/.gitkeep
 !secrets/README.md
+secrets/tokens/
+
+# The drop folder for your resume: only the reminder is tracked
+resume/*
+!resume/README.txt
 
 runs/
 
