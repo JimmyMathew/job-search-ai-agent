@@ -40,14 +40,21 @@ def _matched_keyword(text: str, keywords: str) -> str | None:
 
 
 def apply_block_rules(
-    jobs: list[dict[str, Any]], rules: list[dict[str, Any]]
+    jobs: list[dict[str, Any]], rules: list[dict[str, Any]], *, title_only: bool = False
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split jobs into (passed, blocked). With title_only, rules are checked against the title
+    alone, which lets a job be blocked before its description is fetched. Anything blocked on
+    its title alone would also have been blocked with the description, so nothing new is hidden."""
     block_rules = _active_block_rules(rules)
     passed: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
 
     for job in jobs:
-        text = f"{job.get('title', '')} {job.get('description', '')}"
+        text = (
+            job.get("title", "")
+            if title_only
+            else f"{job.get('title', '')} {job.get('description', '')}"
+        )
         hit = None
         for rule in block_rules:
             keyword = _matched_keyword(text, rule["keywords"])
@@ -74,12 +81,15 @@ def main() -> None:
     parser.add_argument("--rules", type=Path, required=True)
     parser.add_argument("--out-passed", type=Path, required=True)
     parser.add_argument("--out-blocked", type=Path, required=True)
+    parser.add_argument(
+        "--title-only", action="store_true", help="Check rules against titles only (pre-fetch)"
+    )
     args = parser.parse_args()
 
     jobs = unwrap_jobs(load_json(args.in_path))
     rules = load_json(args.rules)
 
-    passed, blocked = apply_block_rules(jobs, rules)
+    passed, blocked = apply_block_rules(jobs, rules, title_only=args.title_only)
 
     save_json(args.out_passed, {"jobs": passed, "count": len(passed)})
     save_json(args.out_blocked, {"jobs": blocked, "count": len(blocked)})

@@ -50,8 +50,14 @@ You can edit or turn off any rule in the AI_Rules tab.
 
 ## Costs and limits
 
-- The AI scoring step uses your Claude subscription. `max_jobs_to_score_per_run` in `config.yaml`
-  (default 60) caps it; the run also asks you before scoring.
+- The AI scoring step uses your Claude subscription. Before scoring, the run tells you how many
+  jobs it found and a rough usage estimate, and asks how many to score. Your first run suggests
+  30, later runs 60 (`first_run_max_jobs_to_score` and `max_jobs_to_score_per_run` in
+  `config.yaml`). You can also pass a number: `/job-run your-name 20`. Every new job still lands in
+  your sheet, scored or not.
+- Nothing is lost if a run stops (a crash, closing the laptop, hitting your Claude usage limit).
+  Each batch of scores is saved to your sheet as soon as it is done, and the next
+  `/job-run` finishes any unscored rows first.
 - Searching LinkedIn is free but rate-limited. If it reports being blocked, wait a few hours.
 
 ## Several people, one computer
@@ -67,7 +73,7 @@ Run `uv run scripts/doctor.py --profile your-name` first; it explains most probl
 | --- | --- |
 | Sheet errors (404, 403) | [docs/google-sheet-setup.md](docs/google-sheet-setup.md), troubleshooting table |
 | "Blocked" / zero jobs found | LinkedIn rate-limited you. Wait a few hours; avoid VPNs and work networks |
-| Rows stuck on "Pending" | A run was interrupted. In Claude Code say: "score the Pending rows in my sheet" (normal re-runs skip jobs already in the sheet) |
+| Rows stuck on "Pending" | A run was interrupted. Just run `/job-run your-name` again; it finishes the Pending rows first |
 | Missing packages | `uv sync` (or `pip install -r requirements.txt`) |
 
 ## Your data and privacy

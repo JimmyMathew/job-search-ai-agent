@@ -1,108 +1,113 @@
 ---
-description: Run one evening's job search + learning cycle for a profile
-argument-hint: <profile-name>
+description: Run one job search + learning cycle for a profile
+argument-hint: <profile-name> [max-jobs-to-score]
+model: sonnet
 ---
 
-Run the full cycle for profile `$ARGUMENTS`. If no argument was given, run
-`python scripts/new_profile.py --list`: if exactly one profile exists use it, otherwise ask which.
-Confirm the profile folder (`profiles/<name>/`) exists, then run
-`python scripts/doctor.py --profile <name>`; if it reports anything to FIX, stop and help fix it
-(see docs/google-sheet-setup.md) instead of guessing. Use the Python from `.venv` if the project
-has one (`.venv/Scripts/python` on Windows, `.venv/bin/python` elsewhere), or `uv run python`.
+Run the full cycle for profile `$ARGUMENTS`. The first word is the profile name; an optional
+second word is the most jobs to score this run. If no profile was given, run
+`python scripts/new_profile.py --list`: use the only profile if there is one, otherwise ask.
 
-Work through these steps in order. Every script call is a `Bash` call to a script under
-`scripts/`, run from the repo root with `python scripts/<name>.py ...`. Nothing here should cost
-tokens except step 2 (learning) and step 9 (scoring) — the rest is mechanical, so just run the
-commands and read their small JSON/text output, don't re-derive what they already computed.
+Run `python scripts/doctor.py --profile <name>` first. If it reports anything to FIX, stop and
+help fix it (see docs/google-sheet-setup.md). Use the project's Python (`.venv/Scripts/python` on
+Windows, `.venv/bin/python` elsewhere) or `uv run python` for every script below; `<name>` is the
+profile and `RUN` is the run folder from step 1.
 
-1. **Read the sheet.**
-   `python scripts/sheet.py --profile $ARGUMENTS meta` → last run time (`last_run_iso`), health
-   fields. `python scripts/sheet.py --profile $ARGUMENTS changed-status --out <run_dir>/changed.json`
-   → rows whose Status/Reason changed since last run.
+**Principles that keep this cheap and safe. Do not break them:**
+- Never read or retype job descriptions yourself. Scripts write batch files; the `job-scorer`
+  subagent reads them. You only run commands and read their one-line output.
+- Everything is saved as it happens. If anything fails or a usage limit stops the run, nothing
+  finished is lost; tell the person to run `/job-run <name>` again and it picks up where it
+  stopped.
 
-2. **Learn, only if `changed.json` is non-empty.** Read `profiles/$ARGUMENTS/profile.md` and the
-   current AI_Rules tab (`python scripts/sheet.py --profile $ARGUMENTS rules --out <run_dir>/rules.json`).
-   For each changed row, work out what it teaches (see CLAUDE.md's "Learning loop" section for
-   the Status → signal mapping and guardrails — 2+ similar rejections before a Block rule, never
-   touch a rule whose "Added by" is anything other than "AI", since those are human-written). Write new rules (`rule`, `type`, `keywords`, `based_on` in a JSON list) with
-   `python scripts/sheet.py --profile $ARGUMENTS add-rules --in <run_dir>/new_rules.json`; they are
-   marked `Added by: AI` automatically. Ask the person if you're unsure — this is the one step
-   worth being careful and deliberate about, since bad rules quietly hide good jobs later. Then
-   `python scripts/sheet.py --profile $ARGUMENTS mark-status-synced --job-ids <ids>` so these
-   rows aren't treated as "changed" again next run. Skip this whole step entirely if
-   `changed.json` was empty — don't spend tokens reasoning about nothing.
+1. **Start.** `python scripts/pipeline.py new-run --profile <name>` prints the run folder (`RUN`).
+   Then `python scripts/pipeline.py recover --profile <name>`: it saves scores an interrupted
+   earlier run produced but never wrote to the sheet.
 
-3. **Fetch (listing only).** Work out `hours_old` from `meta.last_run_iso` (or
-   `first_run_hours_old` from `config.yaml` if there's no last run yet). `python scripts/fetch.py
-   search --profile $ARGUMENTS --hours-old <n> --out <run_dir>/raw.json`. This is cheap (one
-   request per page of ~10 results, no descriptions yet). If it exits with code 2, LinkedIn
-   blocked partway — keep going with what was collected, and say so in the final summary.
+2. **Read the sheet.** `python scripts/sheet.py --profile <name> meta` gives `last_run_iso`.
+   `python scripts/sheet.py --profile <name> changed-status --out RUN/changed.json` gives rows whose
+   Status/Reason changed since last time.
 
-4. **Dedupe.** `python scripts/sheet.py --profile $ARGUMENTS dedupe --in <run_dir>/raw.json --out
-   <run_dir>/deduped.json`. Note the repost count for the summary.
+3. **Learn, only if `changed.json` is non-empty.** Read `profiles/<name>/profile.md` and
+   `python scripts/sheet.py --profile <name> rules --out RUN/rules.json`. For each changed row work
+   out what it teaches (see CLAUDE.md's "Learning loop": a Block rule needs 2+ similar rejections;
+   never touch a rule whose "Added by" is not `AI`). Write new rules as a JSON list of `rule`,
+   `type` (Block/Lower/Boost), `keywords` (`;`-separated), `based_on` to `RUN/new_rules.json`, then
+   `python scripts/sheet.py --profile <name> add-rules --in RUN/new_rules.json`. Then
+   `python scripts/sheet.py --profile <name> mark-status-synced --job-ids <ids>`. Skip this whole
+   step if `changed.json` is empty.
 
-5. **Checkpoint — before fetching any descriptions.** Tell the user the deduped count (e.g. "283
-   new, 0 reposts. Fetch descriptions and score how many?") and wait for an answer (suggest `max_jobs_to_score_per_run` from config.yaml as the default cap): yes/all, a
-   number ("top 40", highest-posted-date first), or stop. This has to come before description
-   fetching, not after — descriptions are the expensive, blockable, per-job-request step, and
-   showing counts after already paying that cost defeats the point of asking. (An earlier version
-   of this file put the checkpoint after prefiltering, which meant descriptions got fetched for
-   every deduped job regardless of the cap — a real bug, fixed 2026-09-28.) If they say stop, this
-   run adds nothing — the deduped jobs haven't been written anywhere yet at this point.
+4. **Backlog first.** `python scripts/sheet.py --profile <name> pending --out RUN/pending.json`.
+   If it holds jobs, an earlier run was interrupted: tell the person "N jobs from an earlier run
+   still need scores; finishing those first", then run
+   export `rules` and `preferences` to `RUN/rules.json` and `RUN/prefs.json` (the commands in step
+   9), then run
+   `python scripts/pipeline.py resume-plan --pending RUN/pending.json --cap <cap> --run-dir RUN`
+   (cap as in step 8) and jump to step 10. When the backlog is done, tell them to run `/job-run`
+   again for new jobs. If nothing is pending, continue.
 
-6. **Write pending rows immediately — before the slow steps, not after.** Split
-   `deduped.json`'s `"new"` array into the capped subset (to be scored) and the rest. Write both
-   to the sheet right now: the capped subset with `score` blank and `why`/`filtered_reason` set to
-   "Pending — awaiting description fetch and scoring"; the rest with `why` set to "not scored this
-   run (over the per-run limit)" (this second group is already in its final state — no update
-   needed later). Both via `python scripts/sheet.py --profile $ARGUMENTS append-jobs --in
-   <file>.json`. This is the fix for a real problem: description-fetching and scoring can take
-   30+ minutes on a large batch, and until 2026-09-28 nothing reached the sheet until the very
-   end — a crash or interruption partway lost all visibility into work already done, even though
-   the person could see nothing had been saved. Writing immediately means the worst case is
-   "some rows still say Pending," never "nothing happened."
+5. **Search (listing only, cheap).** `hours_old` comes from `last_run_iso`, or
+   `first_run_hours_old` in `profiles/<name>/config.yaml` if there is none.
+   `python scripts/fetch.py search --profile <name> --hours-old <n> --out RUN/raw.json` (run it as a
+   background command; it takes minutes). Progress is saved after every search. Exit code 2 means
+   LinkedIn blocked partway: continue with what was collected and say so at the end.
 
-7. **Fetch descriptions — only for the capped subset.** `python scripts/fetch.py descriptions
-   --in <run_dir>/deduped_new.json --out <run_dir>/with_descriptions.json`. If it exits with code
-   2, LinkedIn blocked partway through descriptions — keep whatever came back (some jobs will have
-   `description: ""`) and note it in the summary.
+6. **Dedupe.**
+   `python scripts/sheet.py --profile <name> dedupe --in RUN/raw.json --out RUN/deduped.json`.
 
-8. **Prefilter.** `python scripts/prefilter.py --in <run_dir>/with_descriptions.json --rules
-   <run_dir>/rules.json --out-passed <run_dir>/passed.json --out-blocked <run_dir>/blocked.json`
-   (re-fetch rules first if step 2 changed them). Blocked jobs already have a "Pending" row from
-   step 6 — hold `blocked.json` to update (not append) at step 10, with `score` left blank and
-   `why` set to the block reason.
+7. **Checkpoint.**
+   `python scripts/pipeline.py checkpoint --profile <name> --deduped RUN/deduped.json` (add
+   `--first-run` if `last_run_iso` was empty). Show its `message` to the person.
 
-9. **Score.** `python scripts/sheet.py --profile $ARGUMENTS preferences --out
-   <run_dir>/preferences.json` — only rows the job seeker actually filled in come back; if empty,
-   just tell the scorer there are no stated preferences this run. Split the jobs to score into
-   batches of 10. For each batch, use the `Agent` tool with `subagent_type: job-scorer`, passing
-   it the full text of `profiles/$ARGUMENTS/profile.md`, the active Lower/Boost rules from
-   `rules.json`, `preferences.json`'s rows, and the batch (title, company, location, posted_date,
-   link, description trimmed to ~1500 words — see `trim_description` in `scripts/util.py`, or trim
-   inline). Collect the JSON-lines results.
+8. **Decide the cap.** Use the number from the command's second argument if given. Otherwise ask
+   with the AskUserQuestion tool, offering `suggested_cap`, a smaller number (about half), and
+   "Don't score, just add the jobs". Explain that every new job lands in their sheet either way;
+   the cap only limits how many get AI scores. If they choose none, use cap 0.
 
-10. **Update the pending rows with real results.** Merge each scored job's score/why/gaps/
-    role_type/flags, combine with the blocked jobs from step 8, and write with
-    `python scripts/sheet.py --profile $ARGUMENTS update-jobs --in <run_dir>/results.json` — this
-    updates the existing "Pending" rows in place by Job ID, it does not append new rows (the
-    over-the-cap rows from step 6 are already in their final state and don't need this). Then
-    `python scripts/sheet.py --profile $ARGUMENTS update-meta --set last_run_iso=<now, only after
-    the update succeeds> --set jobs_seen_last_run=<n> --set jobs_added_last_run=<n> --set
-    reposts_skipped_last_run=<n> --set linkedin_status=<ok|blocked|partial>`.
+9. **Write every job to the sheet now, before any slow step.**
+   `python scripts/sheet.py --profile <name> rules --out RUN/rules.json`, then
+   `python scripts/sheet.py --profile <name> preferences --out RUN/prefs.json`, then
+   `python scripts/pipeline.py plan --deduped RUN/deduped.json --rules RUN/rules.json --cap <cap> --run-dir RUN`
+   and `python scripts/sheet.py --profile <name> append-jobs --in RUN/append.json`. Only now
+   advance the search window, unless step 5 was blocked:
+   `python scripts/sheet.py --profile <name> update-meta --set last_run_iso=<started_at from
+   RUN/raw.json> --set jobs_seen_last_run=<n> --set jobs_added_last_run=<n> --set
+   reposts_skipped_last_run=<n> --set linkedin_status=<ok|blocked>`.
+   If the cap is 0 you are done: summarize.
 
-11. **Summarize** in a few lines: new jobs added, top 3 by score (title, company, score, link),
-    rules added or changed this run, reposts skipped, and any LinkedIn trouble. If AI_MetaData
-    shows zero jobs found two runs in a row, say that plainly — it likely means LinkedIn is blocking, not
-    that there are no jobs.
+10. **Fetch descriptions, only for the jobs to score.**
+    `python scripts/fetch.py descriptions --in RUN/to_score.json --out RUN/with_descriptions.json`
+    (background). Every description is saved as it arrives, so if it exits with code 2 (blocked) or
+    is interrupted, running the same command again continues without refetching. Jobs whose
+    description could not be fetched stay Pending and are retried next run.
 
-If anything fails after step 6, the sheet already has every job the run found — worst case some
-rows are stuck at "Pending" (safe to re-run `update-jobs` once descriptions/scoring are re-done
-for just those Job IDs). If it fails before step 6, nothing has been written yet, and the next
-run picks up the same window again.
+11. **Prefilter and batch.**
+    `python scripts/prefilter.py --in RUN/with_descriptions.json --rules RUN/rules.json --out-passed
+    RUN/passed.json --out-blocked RUN/blocked.json`, then
+    `python scripts/sheet.py --profile <name> update-jobs --in RUN/blocked.json` (blocked rows get
+    their reason), then
+    `python scripts/pipeline.py make-batches --profile <name> --run-dir RUN --jobs RUN/passed.json
+    --rules RUN/rules.json --prefs RUN/prefs.json`.
 
-**Timing note:** each keyword/location search takes roughly 15-40s (paginated, 3-7s pause
-between pages), and each description fetch takes a couple seconds plus a 2-5s pause. A profile
-with N keywords × M locations runs N×M searches — e.g. 19 keywords × 3 locations = 57 —
-so a full listing search alone can run several minutes; that's expected, not stuck. Run
-fetch/description steps as background Bash calls so the session isn't blocked waiting on them.
+12. **Score, one batch at a time.** Repeat until done:
+    - `python scripts/pipeline.py next --run-dir RUN` prints either `{"done": true}` or a batch with
+      `batch_file`, `context_file` and `scores_file` paths.
+    - Call the `job-scorer` subagent (`model: sonnet`) with a prompt that is only the four paths:
+      the absolute path of `profiles/<name>/profile.md`, the `context_file`, the `batch_file`, and
+      the `scores_file`. Don't paste any file content into the prompt.
+    - `python scripts/pipeline.py ingest --profile <name> --run-dir RUN --batch <n>` validates the
+      scores, writes them to the sheet right away, and queues one retry for any job the scorer
+      skipped. Report its one-line result.
+    Stop and explain plainly if the scorer errors or a usage limit is hit; everything scored so far
+    is already in the sheet.
+
+13. **Summarize** in a few lines: new jobs added, how many scored, the top 3 from
+    `python scripts/pipeline.py summary --run-dir RUN --top 3` (title, company, score, link), rules
+    added or changed, reposts skipped, any LinkedIn trouble, and any jobs left Pending (they are
+    finished by the next `/job-run`). If AI_MetaData shows zero jobs found two runs in a row, say
+    plainly that LinkedIn is probably blocking, not that there are no jobs. Remind them not to sort
+    or delete rows in the sheet while a run is writing.
+
+**Timing note:** each keyword/location search takes roughly 15-40s and each description fetch a
+few seconds, so large runs take a long time; that is expected, not stuck. Run the search and
+description commands in the background so the session isn't blocked waiting.

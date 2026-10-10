@@ -189,3 +189,79 @@ def find_changed_status_rows(
 
 def snapshot_entry(status: str, reason: str) -> str:
     return _feedback(status.strip(), reason.strip())
+
+
+# ---- Row states in "Why it matches" -------------------------------------------------
+# A blank Score can mean several things; the text in "Why it matches" says which. Code
+# decides what to do with a row by these prefixes, so they live here, in one place.
+
+WHY_PENDING = "Pending — awaiting description fetch and scoring"
+WHY_DESCRIPTION_UNAVAILABLE = "Pending — description unavailable (LinkedIn blocked), will retry"
+WHY_SCORING_FAILED = "Scoring failed — will retry next run"
+WHY_OVER_CAP = "Not scored this run (over the per-run limit)"
+_PENDING_PREFIX = "Pending"
+_RETRY_PREFIXES = (_PENDING_PREFIX, "Scoring failed")
+
+
+def needs_scoring(score: Any, why: str) -> bool:
+    """True for a row the agent still owes a score: no score yet, and marked pending or failed.
+    Over-cap and blocked rows also have no score, but they are in their final state."""
+    return str(score).strip() == "" and str(why).strip().startswith(_RETRY_PREFIXES)
+
+
+VALID_ROLE_TYPES = ("target", "adjacent")
+
+
+def parse_scores(text: str, expected_ids: set[str]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Validate a scorer's output.
+
+    Accepts JSON lines, a JSON array, or either inside a code fence (scorers drift from the
+    requested format). Returns (valid_results, problems). Results for IDs outside the batch,
+    out-of-range scores, or an empty `why` are dropped and reported rather than written."""
+    import json
+    import re
+
+    cleaned = re.sub(r"^\s*```(?:json|jsonl)?\s*$", "", text, flags=re.MULTILINE).strip()
+    items: list[Any] = []
+    try:
+        loaded = json.loads(cleaned)
+        items = loaded if isinstance(loaded, list) else [loaded]
+    except ValueError:
+        for line in cleaned.splitlines():
+            line = line.strip().lstrip(",").rstrip(",")
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except ValueError:
+                items.append({"_unparseable": line[:80]})
+
+    valid: list[dict[str, Any]] = []
+    problems: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict) or "_unparseable" in item:
+            problems.append(f"unreadable line: {str(item)[:80]}")
+            continue
+        job_id = str(item.get("job_id", "")).strip()
+        score = item.get("score")
+        if job_id not in expected_ids:
+            problems.append(f"unknown job_id {job_id!r}")
+        elif job_id in seen:
+            problems.append(f"duplicate result for {job_id}")
+        elif isinstance(score, bool) or not isinstance(score, int | float) or not 0 <= score <= 100:
+            problems.append(f"{job_id}: score {score!r} is not 0-100")
+        elif not str(item.get("why", "")).strip():
+            problems.append(f"{job_id}: empty 'why'")
+        else:
+            seen.add(job_id)
+            role_type = str(item.get("role_type", "")).strip().lower()
+            valid.append(
+                {
+                    **item,
+                    "job_id": job_id,
+                    "score": int(round(score)),
+                    "role_type": role_type if role_type in VALID_ROLE_TYPES else "adjacent",
+                }
+            )
+    return valid, problems

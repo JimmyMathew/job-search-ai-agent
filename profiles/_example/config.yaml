@@ -25,6 +25,8 @@ explore_adjacent_roles: true
 # Default cap on how many jobs the AI scores per run (this uses your Claude usage); you are asked before each run.
 # Every new job still lands in your sheet, scored or not.
 # max_jobs_to_score_per_run: 60
+# Smaller cap for your very first run, so you can see results before spending more.
+# first_run_max_jobs_to_score: 30
 
 # How many hours back to search on your very first run.
 # first_run_hours_old: 72

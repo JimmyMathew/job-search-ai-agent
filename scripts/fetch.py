@@ -21,17 +21,19 @@ without touching the sheet at all.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import random
 import re
 import sys
 import time
 import types
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from config import ProfileError, load_config, load_profile_md
-from util import extract_job_id, load_json, save_json, unwrap_jobs
+from util import extract_job_id, load_json, now_iso, save_json, unwrap_jobs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("fetch")
@@ -106,8 +108,15 @@ def fetch_for_keyword(
     return jobs
 
 
-def fetch_all(profile: str, hours_old: int) -> tuple[list[dict[str, Any]], bool]:
-    """Returns (jobs, was_blocked). Partial results are kept on a block."""
+def fetch_all(
+    profile: str,
+    hours_old: int,
+    on_progress: Callable[[list[dict[str, Any]]], None] | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Returns (jobs, was_blocked). Partial results are kept on a block.
+
+    `on_progress` is called with the jobs found so far after every keyword x location search,
+    so the caller can checkpoint them to disk."""
     config = load_config(profile)
     keywords = _keywords_for(profile, config["roles"])
     locations: list[str] = config["locations"]
@@ -129,6 +138,8 @@ def fetch_all(profile: str, hours_old: int) -> tuple[list[dict[str, Any]], bool]
                 if job["job_id"] not in seen_ids:
                     seen_ids.add(job["job_id"])
                     all_jobs.append(job)
+            if on_progress:
+                on_progress(all_jobs)
             _pause()
         if blocked:
             break
@@ -173,38 +184,65 @@ def _keywords_for(profile: str, roles: list[str]) -> list[str]:
     return keywords
 
 
-def fetch_descriptions(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+def _load_cached_descriptions(cache_path: Path | None) -> dict[str, str]:
+    """Descriptions already fetched by an earlier, interrupted attempt (job_id -> text)."""
+    cached: dict[str, str] = {}
+    if cache_path and cache_path.exists():
+        for line in cache_path.read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue  # a half-written last line from a crash
+            if entry.get("description"):
+                cached[str(entry["job_id"])] = entry["description"]
+    return cached
+
+
+def fetch_descriptions(
+    jobs: list[dict[str, Any]], cache_path: Path | None = None
+) -> tuple[list[dict[str, Any]], bool]:
     """Fetch the full description for each job (one request per job).
 
-    Only call this on jobs that already survived dedupe — this is the
-    expensive, blockable part of fetching. Returns (jobs_with_description,
-    was_blocked); jobs are returned in the same order, with "description"
-    filled in (possibly "" if that one job's fetch failed without it being
-    a wider block).
-    """
+    Only call this on jobs that already survived dedupe: this is the expensive, blockable
+    part of fetching. Returns (jobs_with_description, was_blocked), in the same order.
+
+    Each description is appended to `cache_path` (JSON lines) the moment it arrives, and
+    jobs already in the cache are not fetched again, so an interrupted fetch resumes where
+    it stopped. A job whose description could not be fetched gets "description": "" and
+    "description_unavailable": True; those are never sent to the scorer."""
     from jobspy.linkedin import LinkedIn
     from jobspy.model import DescriptionFormat
 
     scraper = LinkedIn()
     scraper.scraper_input = types.SimpleNamespace(description_format=DescriptionFormat.MARKDOWN)
 
+    cached = _load_cached_descriptions(cache_path)
     enriched: list[dict[str, Any]] = []
     consecutive_empty = 0
     blocked = False
 
     for i, job in enumerate(jobs):
+        job_id = str(job["job_id"])
+        if job_id in cached:
+            enriched.append({**job, "description": cached[job_id]})
+            continue
         if blocked:
-            enriched.append({**job, "description": ""})
+            enriched.append({**job, "description": "", "description_unavailable": True})
             continue
 
         log.info("Fetching description %d/%d: %s", i + 1, len(jobs), job.get("title"))
-        details = scraper._get_job_details(job["job_id"])
+        details = scraper._get_job_details(job_id)
         description = (details or {}).get("description") or ""
-        enriched.append({**job, "description": description})
 
         if description:
             consecutive_empty = 0
+            enriched.append({**job, "description": description})
+            if cache_path:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with cache_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"job_id": job_id, "description": description}) + "\n")
         else:
+            enriched.append({**job, "description": "", "description_unavailable": True})
             consecutive_empty += 1
             if consecutive_empty >= MAX_CONSECUTIVE_EMPTY_DESCRIPTIONS:
                 log.warning(
@@ -214,7 +252,7 @@ def fetch_descriptions(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                 )
                 blocked = True
 
-        if i < len(jobs) - 1:
+        if i < len(jobs) - 1 and not blocked:
             time.sleep(random.uniform(*PAUSE_BETWEEN_DESCRIPTIONS))
 
     return enriched, blocked
@@ -236,14 +274,32 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "search":
-        jobs, blocked = fetch_all(args.profile, args.hours_old)
-        save_json(args.out, {"jobs": jobs, "blocked": blocked, "count": len(jobs)})
+        started_at = now_iso()  # the next run's search window starts here, not at run end
+
+        def checkpoint(found: list[dict[str, Any]]) -> None:
+            save_json(
+                args.out,
+                {
+                    "jobs": found,
+                    "blocked": False,
+                    "partial": True,
+                    "count": len(found),
+                    "started_at": started_at,
+                },
+            )
+
+        jobs, blocked = fetch_all(args.profile, args.hours_old, on_progress=checkpoint)
+        save_json(
+            args.out,
+            {"jobs": jobs, "blocked": blocked, "count": len(jobs), "started_at": started_at},
+        )
         log.info("Fetched %d unique jobs%s", len(jobs), " (blocked partway)" if blocked else "")
         if blocked:
             sys.exit(2)
     elif args.command == "descriptions":
         jobs = unwrap_jobs(load_json(args.in_path))
-        enriched, blocked = fetch_descriptions(jobs)
+        cache_path = args.out.with_name(args.out.stem + ".cache.jsonl")
+        enriched, blocked = fetch_descriptions(jobs, cache_path)
         save_json(args.out, {"jobs": enriched, "blocked": blocked, "count": len(enriched)})
         log.info(
             "Fetched %d descriptions%s", len(enriched), " (blocked partway)" if blocked else ""

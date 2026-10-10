@@ -9,9 +9,9 @@ for actually running and extending it; end-user setup is in `README.md`.
 
 | Component | Tool | Why |
 | --- | --- | --- |
-| Orchestrator | Claude Code (this session, Opus recommended) | Judgment: sequencing, learning, checkpoints |
-| Scorer | `.claude/agents/job-scorer.md`, Sonnet subagent | Reads many jobs; cheap and fast |
-| Fetch / dedupe / prefilter / sheet I/O | `scripts/*.py` | Mechanical, zero tokens |
+| Orchestrator | Claude Code running `/job-run` (set to Sonnet) | Runs commands and the learning step; never sees job text |
+| Scorer | `.claude/agents/job-scorer.md`, Sonnet subagent | Reads a batch file, writes a scores file |
+| Fetch / dedupe / prefilter / batching / ingest / sheet I/O | `scripts/*.py` | Mechanical, zero tokens |
 
 Nothing person-specific lives in code. A new job seeker is a new folder under `profiles/`, not a
 code change.
@@ -28,6 +28,7 @@ scripts/
   config.py                # profiles + config.yaml: locate, load, default, validate
   util.py                  # JSON/time helpers, job ID parsing, repost logic
   fetch.py                 # JobSpy LinkedIn search, one profile's keywords × locations
+  pipeline.py              # plan, batch, ingest scores, recover after a crash (the middle of /job-run)
   sheet_schema.py          # sheet layout (tabs, headers, seed rows) + pure row/diff logic
   sheet.py                 # all Google Sheet reads/writes (gspread) + CLI
   prefilter.py             # applies Block rules as keyword checks, no model involved
@@ -67,8 +68,10 @@ postings for every keyword in `profile.md` (listing only, cheap) → dedupe agai
 already seen → checkpoint (caps how many get *scored*, not how many get written) → **write every
 deduped job to the sheet immediately, as "Pending" for the capped subset and its final state for
 the rest** → fetch full descriptions for just the capped subset (the expensive, blockable request)
-→ prefilter with Block rules → score the survivors in batches of 10 via the Sonnet subagent →
-update those same Pending rows in place with real results → update AI_MetaData → summarize.
+→ prefilter with Block rules → score the survivors in batches of 10 via the Sonnet subagent,
+saving each batch's results to the sheet as soon as it is scored (`pipeline.py ingest`, which
+updates the Pending rows in place) → summarize. A run that is interrupted for any reason leaves
+only Pending rows behind, and the next `/job-run` finishes them first.
 
 Jobs get written to the sheet *before* the slow description/scoring steps, not after — an earlier
 version wrote everything in one batch at the very end, which meant a crash or interruption during
@@ -82,9 +85,10 @@ LinkedIn only returns full descriptions via a separate per-job request. Fetching
 raw search result instead of just the deduped survivors was an early bug here (each keyword
 search took 90-140s instead of ~20s); see `scripts/fetch.py`'s module docstring.
 
-If a run is interrupted, nothing is lost and nothing is double-counted: `last_run_iso` in
-AI_MetaData is only updated after the sheet writes succeed, so an interrupted run's window gets
-picked up again next time.
+If a run is interrupted, nothing is lost and nothing is double-counted: `last_run_iso` is set to
+the moment the search *started* (so jobs posted during a long run are not skipped), and only
+after the Pending rows are written; a blocked search does not advance it. Re-appending jobs
+already in the sheet is a no-op.
 
 Onboarding a new person or refreshing an existing profile's `profile.md`:
 
@@ -176,9 +180,18 @@ file is the source of truth if this doc and the code ever disagree.
 - Fetch, dedupe, prefilter, and sheet I/O are Python; never do them by reasoning over data in the
   main context.
 - Skip the learning step entirely when `changed-status` comes back empty.
-- Always stop at the checkpoint after prefiltering — never auto-score everything without asking.
-- Trim descriptions before they reach the scorer (`trim_description` in `scripts/util.py`, ~1500
-  words). Batch 10 jobs per `job-scorer` subagent call, not one call per job.
+- Always stop at the checkpoint (after dedupe, before any description is fetched) and cap how many
+  jobs get scored. The first-ever run defaults to a smaller cap (`first_run_max_jobs_to_score`).
+- Job text never passes through the orchestrator: `pipeline.py make-batches` writes batch files,
+  the `job-scorer` subagent reads one and writes a scores file, `pipeline.py ingest` validates it
+  and saves it to the sheet. Prompts to the scorer are file paths only.
+- Descriptions are trimmed to `description_max_words` (default 1500; benefits sections can hold
+  the salary, so don't cut deeper without measuring). Batch 10 jobs per scorer call.
+- Save as you go: each batch is written to the sheet as soon as it is scored, descriptions are
+  cached as they are fetched, and the next run finishes any "Pending" rows before searching.
+- `/job-run` is set to Sonnet, but a command's model setting lasts only for the current turn, so
+  after the checkpoint reply the session may run on the user's own model. That is why the
+  orchestrator must stay terse and keep job text out of its context.
 
 ## Current status
 

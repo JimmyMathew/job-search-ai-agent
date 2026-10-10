@@ -26,10 +26,18 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "explore_adjacent_roles": True,
     "credentials": "secrets/service-account.json",
     "max_jobs_to_score_per_run": 60,
+    "first_run_max_jobs_to_score": 30,
+    "description_max_words": 1500,
     "first_run_hours_old": 72,
     "results_per_keyword": 100,
 }
-_POSITIVE_INT_KEYS = ("max_jobs_to_score_per_run", "first_run_hours_old", "results_per_keyword")
+_POSITIVE_INT_KEYS = (
+    "max_jobs_to_score_per_run",
+    "first_run_max_jobs_to_score",
+    "description_max_words",
+    "first_run_hours_old",
+    "results_per_keyword",
+)
 
 _SHEET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,}$")
 _SHEET_URL_RE = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]+)")

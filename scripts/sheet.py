@@ -8,6 +8,7 @@ CLI (each subcommand prints a short result, or reads/writes JSON files):
     python scripts/sheet.py --profile <name> add-rules      --in new_rules.json
     python scripts/sheet.py --profile <name> preferences    --out prefs.json
     python scripts/sheet.py --profile <name> changed-status --out changed.json
+    python scripts/sheet.py --profile <name> pending        --out pending.json
     python scripts/sheet.py --profile <name> mark-status-synced --job-ids 123 456
     python scripts/sheet.py --profile <name> dedupe         --in raw.json --out deduped.json
     python scripts/sheet.py --profile <name> append-jobs    --in jobs.json
@@ -42,6 +43,7 @@ from sheet_schema import (
     TAB_HEADERS,
     find_changed_status_rows,
     job_to_row,
+    needs_scoring,
     snapshot_entry,
 )
 from util import is_repost, load_json, now_iso, save_json, unwrap_jobs
@@ -315,15 +317,21 @@ class SheetClient:
 
     # ---- Writing job rows -----------------------------------------------------
 
-    def append_jobs(self, jobs: list[dict[str, Any]]) -> None:
+    def append_jobs(self, jobs: list[dict[str, Any]]) -> int:
         """Add jobs to the Jobs tab, scored, low-scored or blocked alike; only Why/Gaps/Score
-        differ. Columns are placed by the sheet's own header names, not by position."""
+        differ. Columns are placed by the sheet's own header names, not by position.
+        Returns how many rows were actually added (jobs already present are skipped)."""
         ws = self._worksheet(JOBS_TAB)
         headers = ws.row_values(1)
         today = now_iso()[:10]
-        rows = [job_to_row(job, headers, today) for job in jobs]
+        # Skip jobs already in the sheet, so retrying a write never creates duplicate rows.
+        id_col = headers.index("Job ID")
+        known = {row[id_col] for row in ws.get_all_values()[1:] if len(row) > id_col}
+        fresh = [job for job in jobs if str(job.get("job_id", "")) not in known]
+        rows = [job_to_row(job, headers, today) for job in fresh]
         if rows:
             ws.append_rows(rows)
+        return len(rows)
 
     def update_jobs(self, jobs: list[dict[str, Any]]) -> int:
         """Fill in Score/Why/Gaps/Flags/Role type on rows already in the sheet (matched by
@@ -332,31 +340,61 @@ class SheetClient:
         Second half of "write early, fill in later": raw listings are appended as Pending right
         after dedupe, so a crash during slow description-fetching or scoring never loses what
         was found; this then updates those same rows in place. Unknown Job IDs are skipped.
-        Returns how many rows were updated."""
+        Returns how many rows were updated.
+
+        Cell addresses come from a snapshot of the sheet, so if the person sorted or deleted
+        rows in the instant between reading and writing, scores could land on the wrong rows.
+        After writing, the Job ID column is re-read and the update redone once if it moved."""
         from gspread.utils import rowcol_to_a1
 
         ws = self._worksheet(JOBS_TAB)
-        rows = ws.get_all_values()
-        headers = rows[0]
-        id_col = headers.index("Job ID")
-        row_of_job = {
-            row[id_col]: idx for idx, row in enumerate(rows[1:], start=2) if len(row) > id_col
-        }
-        scoring_cols = [(h, headers.index(h)) for h in SCORING_HEADERS if h in headers]
+        for attempt in (1, 2):
+            rows = ws.get_all_values()
+            headers = rows[0]
+            id_col = headers.index("Job ID")
+            row_of_job = {
+                row[id_col]: idx for idx, row in enumerate(rows[1:], start=2) if len(row) > id_col
+            }
+            scoring_cols = [(h, headers.index(h)) for h in SCORING_HEADERS if h in headers]
 
-        updates, updated = [], 0
-        for job in jobs:
-            row_idx = row_of_job.get(str(job.get("job_id", "")))
-            if row_idx is None:
-                continue
-            for header, col in scoring_cols:
-                value = job_to_row(job, [header], "")[0]
-                updates.append({"range": rowcol_to_a1(row_idx, col + 1), "values": [[value]]})
-            updated += 1
-
-        if updates:
+            updates, updated = [], 0
+            for job in jobs:
+                row_idx = row_of_job.get(str(job.get("job_id", "")))
+                if row_idx is None:
+                    continue
+                for header, col in scoring_cols:
+                    value = job_to_row(job, [header], "")[0]
+                    updates.append({"range": rowcol_to_a1(row_idx, col + 1), "values": [[value]]})
+                updated += 1
+            if not updates:
+                return 0
             ws.batch_update(updates)
+
+            after = ws.col_values(id_col + 1)
+            moved = any(
+                idx - 1 >= len(after) or after[idx - 1] != job_id
+                for job_id, idx in row_of_job.items()
+                if job_id in {str(j.get("job_id", "")) for j in jobs}
+            )
+            if not moved or attempt == 2:
+                return updated
         return updated
+
+    def get_pending_jobs(self) -> list[dict[str, Any]]:
+        """Rows still owed a score (Pending or failed), as job dicts ready for the fetch step."""
+        return [
+            {
+                "job_id": str(r.get("Job ID", "")),
+                "title": r.get("Job title", ""),
+                "company": r.get("Company", ""),
+                "location": r.get("Location", ""),
+                "posted_date": r.get("Posted") or None,
+                "link": r.get("Link", ""),
+            }
+            for r in self._worksheet(JOBS_TAB).get_all_records()
+            if str(r.get("Job ID", "")).strip()
+            and needs_scoring(r.get("Score", ""), str(r.get("Why it matches", "")))
+        ]
 
 
 # ---- CLI -------------------------------------------------------------------
@@ -372,7 +410,7 @@ def _build_parser() -> argparse.ArgumentParser:
     for name in ("init-tabs", "test-write", "meta", "apply-status-validation"):
         sub.add_parser(name)
 
-    for name in ("rules", "preferences", "changed-status"):
+    for name in ("rules", "preferences", "changed-status", "pending"):
         sub.add_parser(name).add_argument("--out", type=Path, required=True)
 
     dedupe_p = sub.add_parser("dedupe")
@@ -418,6 +456,10 @@ def main() -> None:
     elif command == "changed-status":
         save_json(args.out, client.get_changed_status_rows())
         print(f"Wrote changed-status rows to {args.out}")
+    elif command == "pending":
+        pending = client.get_pending_jobs()
+        save_json(args.out, pending)
+        print(f"{len(pending)} jobs still waiting for a score; wrote {args.out}")
     elif command == "mark-status-synced":
         client.mark_status_synced(args.job_ids)
         print(f"Synced status for {len(args.job_ids)} jobs")
@@ -427,8 +469,8 @@ def main() -> None:
         print(f"{len(result['new'])} new, {len(result['reposts'])} reposts skipped")
     elif command == "append-jobs":
         jobs = unwrap_jobs(load_json(args.in_path))
-        client.append_jobs(jobs)
-        print(f"Appended {len(jobs)} rows to Jobs")
+        added = client.append_jobs(jobs)
+        print(f"Appended {added} rows to Jobs ({len(jobs) - added} already present)")
     elif command == "update-jobs":
         jobs = unwrap_jobs(load_json(args.in_path))
         updated = client.update_jobs(jobs)

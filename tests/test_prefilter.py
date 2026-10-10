@@ -43,3 +43,13 @@ def test_special_characters_in_keywords_are_literal():
     rule = {**RULE, "keywords": "c++"}
     _, blocked = apply_block_rules([job("C++ Developer")], [rule])
     assert blocked
+
+
+def test_title_only_ignores_the_description():
+    passed, blocked = apply_block_rules(
+        [job("Advisor", "great sales team")], [RULE], title_only=True
+    )
+    assert passed
+    assert not blocked
+    _, blocked = apply_block_rules([job("Sales Advisor")], [RULE], title_only=True)
+    assert blocked
