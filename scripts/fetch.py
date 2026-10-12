@@ -231,7 +231,9 @@ def fetch_descriptions(
             continue
 
         log.info("Fetching description %d/%d: %s", i + 1, len(jobs), job.get("title"))
-        details = scraper._get_job_details(job_id)
+        # JobSpy 1.3 renamed the private _get_job_details to _fetch_details (same result).
+        get_details = getattr(scraper, "_fetch_details", None) or scraper._get_job_details
+        details = get_details(job_id)
         description = (details or {}).get("description") or ""
 
         if description:
