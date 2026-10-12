@@ -1,4 +1,15 @@
-from sheet_schema import JOBS_HEADERS, find_changed_status_rows, job_to_row
+from sheet_schema import (
+    COLUMN_WIDTHS,
+    HIDDEN_TABS,
+    JOBS_HEADERS,
+    META_TAB,
+    RULES_TAB,
+    STATUS_SYNC_TAB,
+    TAB_HEADERS,
+    find_changed_status_rows,
+    job_to_row,
+    workbook_filename,
+)
 
 JOB = {
     "job_id": "42",
@@ -72,3 +83,16 @@ class TestChangedStatusRows:
     def test_rows_without_id_or_status_are_ignored(self):
         rows = [self.row("", "Applied"), self.row("2", "")]
         assert find_changed_status_rows(rows, {}) == []
+
+
+class TestWorkbookLayout:
+    def test_filename_is_plain_and_ends_in_xlsx(self):
+        assert workbook_filename("jane-doe") == "Job Search - jane-doe.xlsx"
+
+    def test_only_the_bookkeeping_tabs_are_hidden(self):
+        assert {META_TAB, STATUS_SYNC_TAB} == HIDDEN_TABS
+        assert RULES_TAB not in HIDDEN_TABS  # the person may edit rules by hand
+
+    def test_every_width_names_a_real_header(self):
+        headers = {h for tab_headers in TAB_HEADERS.values() for h in tab_headers}
+        assert set(COLUMN_WIDTHS) <= headers

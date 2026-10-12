@@ -4,9 +4,9 @@
     python scripts/new_profile.py jane-doe --resume "C:/Users/me/Jane Resume.pdf"
     python scripts/new_profile.py --list                         # shows existing profiles
 
-The folder holds the resume and config.yaml. Without --resume, a single resume sitting in the
-top-level resume/ drop folder is used. Everything under profiles/ except the _example template
-is git-ignored, so personal data stays local.
+The folder holds the resume, config.yaml and, later, your Excel job list. Without --resume,
+a single resume sitting in the top-level resume/ drop folder is used. Everything under
+profiles/ except the _example template is git-ignored, so personal data stays local.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from config import (
     list_profiles,
     looks_like_resume_file,
 )
+from util import run_cli
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 DROP_FOLDER = REPO_ROOT / "resume"
@@ -84,8 +85,8 @@ def main() -> None:
         step += 1
     print(f"  {step}. Edit {target / 'config.yaml'}: set your locations")
     step += 1
-    print(f"  {step}. python scripts/sheet.py --profile {args.name} connect")
-    print("     (opens a browser tab to sign in to Google, then creates your sheet)")
+    print(f"  {step}. python scripts/sheet.py --profile {args.name} init")
+    print("     (creates your job list, an Excel file in your profile folder)")
     step += 1
     print(f"  {step}. python scripts/doctor.py --profile {args.name}")
     step += 1
@@ -93,4 +94,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_cli(main)

@@ -3,6 +3,7 @@ import json
 import pipeline
 import pytest
 from sheet_schema import WHY_OVER_CAP, WHY_PENDING, WHY_SCORING_FAILED, needs_scoring, parse_scores
+from workbook import LOCKED_PREFIX, WorkbookLocked
 
 
 def make_job(i, title="Analyst", posted="2026-10-01", description="Some description"):
@@ -248,6 +249,60 @@ class TestIngestBatch:
         pipeline.ingest_batch(client, tmp_path, 1)  # queues retry as batch 2
         pipeline.ingest_batch(client, tmp_path, 2)  # still nothing
         assert client.updates == [{"job_id": "1", "why": WHY_SCORING_FAILED}]
+
+
+class LockedClient:
+    """A client whose job list is open in Excel: every write is refused."""
+
+    def update_jobs(self, jobs):
+        raise WorkbookLocked(f"{LOCKED_PREFIX} close it")
+
+
+class TestIngestWhileTheListIsOpen:
+    def prepare(self, tmp_path, attempt):
+        pipeline.save_json(pipeline._jobs_path(tmp_path), {"1": make_job(1)})
+        state = {
+            "max_words": 1500,
+            "batches": [{"n": 1, "attempt": attempt, "job_ids": ["1"], "status": "todo"}],
+        }
+        pipeline.save_json(pipeline._state_path(tmp_path), state)
+        return state
+
+    def saved_state(self, tmp_path):
+        return json.loads(pipeline._state_path(tmp_path).read_text(encoding="utf-8"))
+
+    def test_scores_that_could_not_be_saved_leave_the_batch_to_do(self, tmp_path):
+        state = self.prepare(tmp_path, attempt=1)
+        scores = json.dumps({"job_id": "1", "score": 60, "why": "ok", "role_type": "target"})
+        pipeline._scores_path(tmp_path, 1).write_text(scores, encoding="utf-8")
+
+        with pytest.raises(WorkbookLocked, match=LOCKED_PREFIX):
+            pipeline.ingest_batch(LockedClient(), tmp_path, 1)
+
+        assert self.saved_state(tmp_path) == state
+        assert pipeline.next_batch(self.saved_state(tmp_path))["n"] == 1
+
+    def test_jobs_that_could_not_be_marked_failed_leave_the_batch_to_do(self, tmp_path):
+        state = self.prepare(tmp_path, attempt=2)  # no scores file: they would be marked failed
+
+        with pytest.raises(WorkbookLocked):
+            pipeline.ingest_batch(LockedClient(), tmp_path, 1)
+
+        assert self.saved_state(tmp_path) == state
+        assert not pipeline._batch_path(tmp_path, 2).exists()
+
+    def test_running_it_again_once_closed_finishes_the_batch(self, tmp_path):
+        self.prepare(tmp_path, attempt=1)
+        scores = json.dumps({"job_id": "1", "score": 60, "why": "ok", "role_type": "target"})
+        pipeline._scores_path(tmp_path, 1).write_text(scores, encoding="utf-8")
+        with pytest.raises(WorkbookLocked):
+            pipeline.ingest_batch(LockedClient(), tmp_path, 1)
+
+        client = FakeClient()
+        pipeline.ingest_batch(client, tmp_path, 1)
+
+        assert [u["job_id"] for u in client.updates] == ["1"]
+        assert pipeline.next_batch(self.saved_state(tmp_path)) is None
 
 
 class TestTopScored:

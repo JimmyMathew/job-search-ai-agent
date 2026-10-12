@@ -1,5 +1,5 @@
 ---
-description: Set up everything from scratch (install, resume, Google sheet), or regenerate a profile.md
+description: Set up everything from scratch (install, resume, Excel job list), or regenerate a profile.md
 argument-hint: [profile-name]
 ---
 
@@ -64,7 +64,7 @@ Skip if the profile folder already exists.
 Read `profiles/<name>/config.yaml`. If `locations:` still has the placeholder (`YOUR CITY, COUNTRY`)
 ask: "Which city or country should I search for jobs in? You can give more than one, and
 'Remote' works too." Then edit the `locations:` block **in place** with the Edit tool, keeping
-every comment and the rest of the file as it is. Never delete or touch `roles`, `auth` or other
+every comment and the rest of the file as it is. Never delete or touch `roles`, `workbook` or other
 lines the person already set.
 
 ## 5. Roles (optional)
@@ -72,30 +72,34 @@ lines the person already set.
 Do not ask yet. If `roles:` in config.yaml is empty, you will propose roles from the resume in
 step 8. If it already lists roles, those are the person's choices.
 
-## 6. Google sign-in and sheet
+## 6. Create your job list
 
-Skip this step if `profiles/<name>/agent-state.json` already exists (the sheet was created
-earlier) or `config.yaml` sets `sheet:` (an existing sheet, advanced option). Step 7 will say if
-signing in again is needed; never run `connect` for those people unless the doctor says to.
+Skip this step if `profiles/<name>/agent-state.json` already exists (the job list was created
+earlier). Running it again is harmless anyway: it only adds what is missing.
 
-1. Tell the person: "A browser tab will open now. Pick your Google account and click Continue or
-   Allow. The app can only see the sheet it creates, nothing else in your Google Drive."
-2. Run `uv run python scripts/sheet.py --profile <name> connect` **in the background** (it
-   waits up to 5 minutes for the sign-in), then read its output as it appears. If it prints a link
-   ("If no browser opened, open this link"), show the link to the person.
-3. When it finishes it prints `SHEET_URL: ...`. Show that address as the person's new sheet.
-4. If it fails because `google_oauth_client.json` is missing, the project owner has not finished
-   their one-time setup (`docs/maintainer-oauth-client.md`). Tell the person plainly that this
-   copy of the app cannot sign in yet and who to contact; offer the advanced option
-   (`docs/service-account-setup.md`) only if they say they want it.
-5. If the person closes the tab or it times out, just run the same command again. It is safe to
-   repeat and never creates a second sheet.
+0. **Old Google sheet check.** If `init` (or the doctor) says this profile **kept its job list in a
+   Google sheet before**, STOP here. Show the person that message (it has the sheet's address),
+   explain in plain words that their history of jobs they have already seen is in that sheet, and
+   ask them to open it, choose File > Download > Microsoft Excel (.xlsx), and save the file at the
+   path the message gives. When they say it is done, run `init` again: it picks the file up and
+   keeps their history. Never run `init --fresh` unless they explicitly say they want an empty
+   list and will see every job again.
+1. Run `uv run python scripts/sheet.py --profile <name> init`. It prints `WORKBOOK: <path>`.
+2. Tell the person: "Your job list is an Excel file on your computer, here: <path>. Nothing is
+   sent to the cloud, and no sign-in is needed." On a Mac they need Excel or the free LibreOffice
+   to open it; Apple Numbers will not work. On any computer without such a program, suggest
+   installing LibreOffice.
+3. If it says `WORKBOOK_OPEN:`, the file is open in Excel: show the message, wait for them to
+   close it, and run the same command again.
+4. If it says the job list file is missing but was created earlier, show that message as it is
+   and do not delete `agent-state.json` on your own: that would make the agent forget every job
+   it has already shown them. Ask what they want.
 
 ## 7. Check
 
 Run `uv run python scripts/doctor.py --profile <name>`. It must show no `FIX`. Fix what it names
 (each FIX says how) and re-run until it passes. A `WARN` about `profile.md` is expected until
-step 8. If it says sign-in is needed, go back to step 6.
+step 8. If it says the job list is missing, go back to step 6.
 
 ## 8. Write profile.md
 
@@ -130,8 +134,16 @@ match.
 
 1. Run `uv run python scripts/doctor.py --profile <name> --online`. It should show a working
    LinkedIn search. (A quiet or blocked search is a `WARN`, not a failure; explain it.)
-2. Tell the person setup is done, and show their sheet address again. Mention the **Preferences**
-   tab in their sheet: optional questions (salary, work setup, industries to avoid); blank means
-   no preference, and they can fill them in any time.
+2. Open their job list for them with `uv run python scripts/sheet.py --profile <name> open`
+   (if it says it cannot, give them the path from step 6 and the LibreOffice hint). Tell them
+   setup is done and explain the list in a few plain lines:
+   - Each new job is a row. Click the filter arrow on the **Score** column, or use Data > Sort,
+     to put the best matches first.
+   - They only fill in **Status** (a dropdown: Interested, Applied, Not for me...) and a short
+     **Reason**. The agent learns from those, especially "Not for me" with a reason.
+   - Save (Ctrl+S) and close the file before the next `/job-run`; the agent cannot update a file
+     that is open.
+   - The **Preferences** tab holds optional questions (salary, work setup, industries to avoid);
+     blank means no preference, and they can fill them in any time.
 3. Offer to run a small first search: `/job-run <name> 10` scores only 10 jobs, so it is a cheap
    way to see results.

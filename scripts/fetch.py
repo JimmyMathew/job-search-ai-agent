@@ -13,9 +13,9 @@ on every raw search result. JobSpy's own `linkedin_fetch_description=True`
 flag does the description fetch *inline* during search, for every result;
 that's what made an early test take 90-140s per keyword, so we don't use it.
 
-Neither phase dedupes against the sheet or writes to Google Sheets — that's
-sheet.py, downstream. Keeping fetch pure means it can be re-run and tested
-without touching the sheet at all.
+Neither phase dedupes against the job list or writes to it — that's sheet.py,
+downstream. Keeping fetch pure means it can be re-run and tested without
+touching the job list at all.
 """
 
 from __future__ import annotations

@@ -2,11 +2,10 @@
 __pycache__/
 *.pyc
 
-# Google credentials stay local
+# Anything private kept in secrets/ stays local
 secrets/*
 !secrets/.gitkeep
 !secrets/README.md
-secrets/tokens/
 
 # The drop folder for your resume: only the reminder is tracked
 resume/*
@@ -24,6 +23,14 @@ profiles/*
 # Resumes and personal documents, wherever they end up
 *.pdf
 *.docx
+
+# Job lists (Excel), the lock files Excel and LibreOffice leave beside them, and the
+# agent's own lock and half-written temporary files
+*.xlsx
+~$*
+.~lock.*#
+.*.agent-lock
+.*.saving.xlsx
 
 # Original design notes mention a specific person; keep local only
 LinkedIn Job Search Agent Plan.md

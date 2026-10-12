@@ -31,11 +31,6 @@
       "Bash(py scripts/new_profile.py:*)",
       "Bash(.venv/Scripts/python scripts/new_profile.py:*)",
       "Bash(.venv/bin/python scripts/new_profile.py:*)",
-      "Bash(uv run python scripts/google_auth.py:*)",
-      "Bash(python scripts/google_auth.py:*)",
-      "Bash(py scripts/google_auth.py:*)",
-      "Bash(.venv/Scripts/python scripts/google_auth.py:*)",
-      "Bash(.venv/bin/python scripts/google_auth.py:*)",
       "Bash(uv sync:*)",
       "Bash(uv --version)",
       "Bash(python --version)",
@@ -48,8 +43,7 @@
       "Read(./secrets/**)",
       "Edit(./secrets/**)",
       "Read(./.env)",
-      "Read(./.env.*)",
-      "Read(./scripts/google_oauth_client.json)"
+      "Read(./.env.*)"
     ]
   }
 }

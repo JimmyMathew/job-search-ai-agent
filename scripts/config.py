@@ -2,9 +2,8 @@
 
 A profile is a folder under profiles/ holding a person's resume, config.yaml and the
 profile.md that /job-setup writes. Only `locations` is required in config.yaml; every other
-setting has a default in CONFIG_DEFAULTS. The sheet is normally created by `sheet.py connect`
-and remembered in profiles/<name>/agent-state.json; `sheet:` in config.yaml is only for the
-advanced "use an existing sheet" (service account) option and wins over the saved state.
+setting has a default in CONFIG_DEFAULTS. The person's results live in one Excel workbook, by
+default inside the profile folder (see workbook_path); the optional `workbook:` setting moves it.
 """
 
 from __future__ import annotations
@@ -14,15 +13,18 @@ import json
 import os
 import re
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from sheet_schema import workbook_filename
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROFILES_DIR = REPO_ROOT / "profiles"
 RUNS_DIR = REPO_ROOT / "runs"
-TOKENS_DIR = REPO_ROOT / "secrets" / "tokens"
 STATE_FILE = "agent-state.json"
-AUTH_MODES = ("oauth", "service_account")
+BACKUPS_DIRNAME = "backups"
+WORKBOOK_SUFFIX = ".xlsx"
 
 EXAMPLE_PROFILE = "_example"
 RESUME_EXTENSIONS = (".pdf", ".docx", ".txt", ".md")
@@ -33,8 +35,6 @@ _RESUME_NAME_RE = re.compile(r"resume|r[eé]sum[eé]|\bcv\b", re.IGNORECASE)
 CONFIG_DEFAULTS: dict[str, Any] = {
     "roles": [],
     "explore_adjacent_roles": True,
-    "credentials": "secrets/service-account.json",
-    "auth": "auto",
     "max_jobs_to_score_per_run": 60,
     "first_run_max_jobs_to_score": 30,
     "description_max_words": 1500,
@@ -48,11 +48,16 @@ _POSITIVE_INT_KEYS = (
     "first_run_hours_old",
     "results_per_keyword",
 )
+# Settings from the Google Sheets era. An old config.yaml may still hold them; they are
+# ignored (never an error) and reported so the doctor can say they are no longer used.
+DEPRECATED_KEYS = ("sheet", "sheet_id", "auth", "credentials")
 
-_SHEET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,}$")
-_SHEET_URL_RE = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]+)")
-_SHEET_PLACEHOLDER_RE = re.compile(r"^\s*(<.*>|paste.*)?\s*$", re.IGNORECASE)
 _LOCATION_PLACEHOLDER_PREFIX = "YOUR "
+
+# Only used to point people with an old Google sheet at their data (see find_legacy_sheet).
+_LEGACY_SHEET_URL = "https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+_LEGACY_SHEET_URL_RE = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]+)")
+_LEGACY_SHEET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,}$")
 
 
 class UserFacingError(RuntimeError):
@@ -103,15 +108,6 @@ def find_resume(profile: str) -> Path | None:
     return (named or candidates or [None])[0]
 
 
-def parse_sheet_id(value: str | None) -> str | None:
-    """Accept a full Google Sheets address or a bare ID; None if unset or still a placeholder."""
-    value = (value or "").strip()
-    if _SHEET_PLACEHOLDER_RE.match(value):
-        return None
-    match = _SHEET_URL_RE.search(value)
-    return match.group(1) if match else value
-
-
 def config_problems(config: dict[str, Any]) -> list[str]:
     """Plain-English list of what's wrong with a loaded config (empty list = fine)."""
     problems = []
@@ -132,34 +128,29 @@ def config_problems(config: dict[str, Any]) -> list[str]:
     elif any(loc.upper().startswith(_LOCATION_PLACEHOLDER_PREFIX) for loc in locations):
         problems.append("`locations` still has the placeholder. Replace it with your own city.")
 
-    # The sheet is optional: setup creates it. Only a sheet that is present must look right.
-    sheet_id = config.get("sheet_id")
-    if sheet_id and not _SHEET_ID_RE.match(sheet_id):
+    if "workbook" in config and not _is_workbook_setting(config["workbook"]):
         problems.append(
-            "`sheet` doesn't look like a Google Sheets address. Copy it from your browser's "
-            "address bar while the sheet is open (it contains /spreadsheets/d/...), or delete "
-            "the line and let setup create a sheet for you."
+            f"`workbook` must be the path of an Excel file ending in {WORKBOOK_SUFFIX} "
+            "(or delete the line to keep it in your profile folder)."
         )
-
-    if str(config.get("auth", "auto")).lower() not in ("auto", *AUTH_MODES):
-        problems.append('`auth` must be "oauth" or "service_account" (or delete the line).')
     return problems
 
 
-def normalize_config(
-    raw: dict[str, Any], profile: str, state: dict[str, Any] | None = None
-) -> dict[str, Any]:
+def _is_workbook_setting(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower().endswith(WORKBOOK_SUFFIX)
+
+
+def normalize_config(raw: dict[str, Any], profile: str) -> dict[str, Any]:
     """Merge raw YAML over the defaults and tidy values. Does not validate.
 
-    Old key names (`sheet_id`, `target_roles`) are still accepted. A sheet set in the YAML
-    beats the one remembered in `state` (agent-state.json)."""
-    config = {**CONFIG_DEFAULTS, **{k: v for k, v in raw.items() if v is not None}}
+    The old key name `target_roles` is still accepted. Keys from the Google Sheets era are
+    dropped from the result and listed under `deprecated_keys` instead of causing an error."""
+    kept = {k: v for k, v in raw.items() if v is not None and k not in DEPRECATED_KEYS}
+    config = {**CONFIG_DEFAULTS, **kept}
     config["name"] = profile
     config["roles"] = raw.get("roles") or raw.get("target_roles") or []
-    yaml_sheet = parse_sheet_id(raw.get("sheet") or raw.get("sheet_id"))
-    config["sheet_from_yaml"] = bool(yaml_sheet)
-    config["sheet_id"] = yaml_sheet or (state or {}).get("sheet_id") or None
-    config["auth"] = str(config.get("auth") or "auto").lower()
+    config["deprecated_keys"] = [key for key in DEPRECATED_KEYS if raw.get(key)]
+    config["legacy_sheet_url"] = _legacy_sheet_url(raw.get("sheet"), raw.get("sheet_id"))
 
     locations = raw.get("locations") or []
     if isinstance(locations, str):
@@ -168,9 +159,47 @@ def normalize_config(
     return config
 
 
+def _legacy_sheet_url(*values: Any) -> str | None:
+    """The address of an old Google sheet, from whichever value holds a sheet address or ID."""
+    for value in values:
+        text = str(value or "").strip()
+        match = _LEGACY_SHEET_URL_RE.search(text)
+        if match:
+            return _LEGACY_SHEET_URL.format(sheet_id=match.group(1))
+        if _LEGACY_SHEET_ID_RE.match(text):
+            return _LEGACY_SHEET_URL.format(sheet_id=text)
+    return None
+
+
+@dataclass(frozen=True)
+class LegacySheet:
+    """Evidence that this profile kept its job list in a Google sheet in an earlier version.
+    `url` is where that sheet is, when the files say."""
+
+    url: str | None
+
+
+def find_legacy_sheet(config: dict[str, Any], state: dict[str, Any]) -> LegacySheet | None:
+    """Whether this profile has job history in an old Google sheet, judging by the settings
+    that version wrote to config.yaml and agent-state.json. That history is what dedupe
+    depends on, so a brand-new empty list must never silently take its place."""
+    url = config.get("legacy_sheet_url") or _legacy_sheet_url(
+        state.get("sheet_url"), state.get("sheet_id")
+    )
+    if config.get("deprecated_keys") or state.get("sheet_id") or state.get("sheet_url"):
+        return LegacySheet(url)
+    return None
+
+
+def sheet_command(profile: str) -> str:
+    """The start of every command that talks to a profile's job list, for messages that tell
+    the person (or Claude on their behalf) what to run."""
+    return f"uv run python scripts/sheet.py --profile {profile}"
+
+
 def load_config(profile: str) -> dict[str, Any]:
-    """Load profiles/<profile>/config.yaml, apply defaults, fold in the saved sheet from
-    agent-state.json, and raise ProfileError listing everything that needs fixing."""
+    """Load profiles/<profile>/config.yaml, apply defaults, and raise ProfileError listing
+    everything that needs fixing."""
     import yaml
 
     config_path = profile_dir(profile) / "config.yaml"
@@ -180,7 +209,7 @@ def load_config(profile: str) -> dict[str, Any]:
             f"Copy it from profiles/{EXAMPLE_PROFILE}/config.yaml."
         )
     with config_path.open("r", encoding="utf-8") as f:
-        config = normalize_config(yaml.safe_load(f) or {}, profile, read_state(profile))
+        config = normalize_config(yaml.safe_load(f) or {}, profile)
 
     problems = config_problems(config)
     if problems:
@@ -197,17 +226,30 @@ def load_profile_md(profile: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def credentials_path(config: dict[str, Any]) -> Path:
-    """Where this person's Google service-account key is (relative paths start at the repo root)."""
-    path = Path(config.get("credentials") or CONFIG_DEFAULTS["credentials"])
-    return path if path.is_absolute() else REPO_ROOT / path
+def workbook_path(profile: str, config: dict[str, Any]) -> Path:
+    """Where this person's Excel job list lives. Only computes the path; touches no file.
+
+    By default it sits in the profile folder. `workbook:` in config.yaml may be an absolute
+    path, one starting with ~ (the home folder), or one relative to the profile folder."""
+    folder = PROFILES_DIR / profile
+    configured = str(config.get("workbook") or "").strip()
+    if not configured:
+        return folder / workbook_filename(profile)
+    path = Path(configured).expanduser()
+    return path if path.is_absolute() else folder / path
+
+
+def backups_dir(profile: str) -> Path:
+    """Where the automatic copies of this person's job list are kept (inside the profile
+    folder even when `workbook:` points elsewhere, so they stay together with the profile)."""
+    return profile_dir(profile) / BACKUPS_DIRNAME
 
 
 def read_state(profile: str) -> dict[str, Any]:
-    """What the app itself remembers about a profile (the sheet it created, and so on).
+    """What the app itself remembers about a profile (the workbook it created, and so on).
 
     Empty if the file is missing or damaged: losing it must never break a run, because
-    `sheet.py connect` can find the sheet again by its title."""
+    `sheet.py init` re-opens the workbook if it is still where the profile expects it."""
     path = profile_dir(profile) / STATE_FILE
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -228,28 +270,3 @@ def write_state(profile: str, data: dict[str, Any]) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
-
-
-def token_path(profile: str) -> Path:
-    """Where this profile's Google sign-in token is kept (git-ignored)."""
-    return TOKENS_DIR / f"{profile}.json"
-
-
-def oauth_client_path() -> Path:
-    """The app's Google OAuth client file (shipped by the project owner, not a user secret)."""
-    override = os.environ.get("JOB_AGENT_OAUTH_CLIENT")
-    return Path(override) if override else REPO_ROOT / "scripts" / "google_oauth_client.json"
-
-
-def choose_auth(config: dict[str, Any], key_exists: bool) -> str:
-    """Which Google sign-in to use: "oauth" or "service_account".
-
-    An explicit `auth:` in config.yaml wins. Otherwise a person who pasted their own sheet
-    into config.yaml and has a service-account key keeps using it, because the app's
-    drive.file access cannot open sheets it did not create. Everyone else gets OAuth."""
-    explicit = str(config.get("auth") or "auto").lower()
-    if explicit in AUTH_MODES:
-        return explicit
-    if config.get("sheet_from_yaml") and key_exists:
-        return "service_account"
-    return "oauth"

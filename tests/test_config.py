@@ -2,19 +2,14 @@ import config
 import pytest
 from config import (
     ProfileError,
-    choose_auth,
     config_problems,
     find_resume,
     list_profiles,
     normalize_config,
-    oauth_client_path,
-    parse_sheet_id,
     read_state,
-    token_path,
+    workbook_path,
     write_state,
 )
-
-SHEET_ID = "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
 
 
 @pytest.fixture
@@ -31,45 +26,63 @@ def make_profile(root, name, files=()):
     return folder
 
 
-class TestParseSheetId:
-    def test_extracts_id_from_url(self):
-        url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit#gid=0"
-        assert parse_sheet_id(url) == SHEET_ID
-
-    def test_accepts_bare_id(self):
-        assert parse_sheet_id(SHEET_ID) == SHEET_ID
-
-    @pytest.mark.parametrize(
-        "value", [None, "", "  ", "PASTE YOUR GOOGLE SHEET ADDRESS HERE", "<id>"]
-    )
-    def test_unset_or_placeholder_is_none(self, value):
-        assert parse_sheet_id(value) is None
-
-
 class TestNormalizeConfig:
     def test_applies_defaults(self):
-        cfg = normalize_config({"locations": ["Berlin"], "sheet": SHEET_ID}, "jane")
+        cfg = normalize_config({"locations": ["Berlin"]}, "jane")
         assert cfg["max_jobs_to_score_per_run"] == 60
         assert cfg["name"] == "jane"
-        assert cfg["sheet_id"] == SHEET_ID
+        assert cfg["deprecated_keys"] == []
 
     def test_blank_value_keeps_default(self):
         cfg = normalize_config({"first_run_hours_old": None}, "jane")
         assert cfg["first_run_hours_old"] == 72
 
-    def test_accepts_legacy_keys(self):
-        cfg = normalize_config({"sheet_id": SHEET_ID, "target_roles": ["Nurse"]}, "jane")
-        assert cfg["sheet_id"] == SHEET_ID
-        assert cfg["roles"] == ["Nurse"]
+    def test_accepts_legacy_roles_key(self):
+        assert normalize_config({"target_roles": ["Nurse"]}, "jane")["roles"] == ["Nurse"]
 
     def test_single_location_string_becomes_list(self):
         assert normalize_config({"locations": "Remote"}, "jane")["locations"] == ["Remote"]
 
+    def test_workbook_setting_is_kept(self):
+        assert normalize_config({"workbook": "~/jobs.xlsx"}, "jane")["workbook"] == "~/jobs.xlsx"
+
+
+class TestOldGoogleSettings:
+    """A config.yaml written for the Google Sheets version must keep working."""
+
+    OLD = {
+        "locations": ["Dubai"],
+        "sheet": "https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit",
+        "auth": "service_account",
+        "credentials": "secrets/service-account.json",
+    }
+
+    def test_old_keys_are_ignored_and_listed(self):
+        cfg = normalize_config(self.OLD, "dubai")
+        assert cfg["deprecated_keys"] == ["sheet", "auth", "credentials"]
+        for key in ("sheet", "sheet_id", "auth", "credentials"):
+            assert key not in cfg
+        assert config_problems(cfg) == []
+
+    def test_the_old_sheet_id_key_is_deprecated_too(self):
+        assert normalize_config({"sheet_id": "abc"}, "jane")["deprecated_keys"] == ["sheet_id"]
+
+    def test_empty_old_keys_do_not_count(self):
+        raw = {"sheet": None, "auth": "", "credentials": None}
+        assert normalize_config(raw, "jane")["deprecated_keys"] == []
+
+    def test_load_config_does_not_crash_on_an_old_file(self, profiles):
+        folder = make_profile(profiles, "dubai")
+        lines = ['locations: ["Dubai"]', 'sheet: "https://docs.google.com/x"', "auth: oauth"]
+        (folder / "config.yaml").write_text("\n".join(lines), encoding="utf-8")
+        cfg = config.load_config("dubai")
+        assert cfg["deprecated_keys"] == ["sheet", "auth"]
+        assert cfg["locations"] == ["Dubai"]
+
 
 class TestConfigProblems:
     def valid(self, **overrides):
-        raw = {"locations": ["Berlin, Germany"], "sheet": SHEET_ID, **overrides}
-        return normalize_config(raw, "jane")
+        return normalize_config({"locations": ["Berlin, Germany"], **overrides}, "jane")
 
     def test_valid_config_has_no_problems(self):
         assert config_problems(self.valid()) == []
@@ -81,19 +94,50 @@ class TestConfigProblems:
         problems = config_problems(self.valid(locations=["YOUR CITY, COUNTRY"]))
         assert any("placeholder" in p for p in problems)
 
-    def test_sheet_is_optional(self):
-        assert config_problems(self.valid(sheet="")) == []
-
-    def test_bad_auth_value(self):
-        assert any("`auth`" in p for p in config_problems(self.valid(auth="password")))
-
-    def test_malformed_sheet(self):
-        assert any("doesn't look like" in p for p in config_problems(self.valid(sheet="oops")))
-
     @pytest.mark.parametrize("value", [0, -5, "many"])
     def test_bad_number(self, value):
         problems = config_problems(self.valid(max_jobs_to_score_per_run=value))
         assert any("max_jobs_to_score_per_run" in p for p in problems)
+
+    @pytest.mark.parametrize("value", ["~/jobs.xlsx", "C:/Lists/Mine.XLSX", "lists/jobs.xlsx"])
+    def test_a_workbook_path_is_fine(self, value):
+        assert config_problems(self.valid(workbook=value)) == []
+
+    @pytest.mark.parametrize("value", ["", "   ", "jobs.csv", "jobs", 5, ["a.xlsx"]])
+    def test_a_workbook_that_is_not_an_excel_path_is_reported(self, value):
+        problems = config_problems(self.valid(workbook=value))
+        assert any("`workbook`" in p for p in problems)
+
+
+class TestWorkbookPath:
+    def test_defaults_to_a_named_file_in_the_profile_folder(self, profiles):
+        assert workbook_path("jane", {}) == profiles / "jane" / "Job Search - jane.xlsx"
+
+    def test_a_relative_path_starts_at_the_profile_folder(self, profiles):
+        path = workbook_path("jane", {"workbook": "lists/mine.xlsx"})
+        assert path == profiles / "jane" / "lists" / "mine.xlsx"
+
+    def test_an_absolute_path_is_used_as_it_is(self, profiles, tmp_path):
+        target = tmp_path / "elsewhere" / "mine.xlsx"
+        assert workbook_path("jane", {"workbook": str(target)}) == target
+
+    def test_a_home_folder_path_is_expanded(self, profiles, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        assert workbook_path("jane", {"workbook": "~/jobs.xlsx"}) == home / "jobs.xlsx"
+
+    @pytest.mark.parametrize("blank", [None, "", "  "])
+    def test_blank_means_the_default(self, profiles, blank):
+        assert workbook_path("jane", {"workbook": blank}).name == "Job Search - jane.xlsx"
+
+    def test_needs_no_files_to_exist(self, profiles):
+        assert not (profiles / "jane").exists()
+        workbook_path("jane", {})
+
+    def test_backups_live_in_the_profile_folder(self, profiles):
+        make_profile(profiles, "jane")
+        assert config.backups_dir("jane") == profiles / "jane" / "backups"
 
 
 class TestProfiles:
@@ -120,39 +164,11 @@ class TestProfiles:
         assert find_resume("jane") is None
 
 
-class TestSheetFromYamlOrState:
-    def test_state_supplies_sheet_when_yaml_has_none(self):
-        cfg = normalize_config({"locations": ["Berlin"]}, "jane", {"sheet_id": SHEET_ID})
-        assert cfg["sheet_id"] == SHEET_ID
-        assert cfg["sheet_from_yaml"] is False
-
-    def test_yaml_sheet_overrides_state(self):
-        other = "9ZyXwVuTsRqPoNmLkJiHgFeDcBa0987654321"
-        cfg = normalize_config({"sheet": SHEET_ID}, "jane", {"sheet_id": other})
-        assert cfg["sheet_id"] == SHEET_ID
-        assert cfg["sheet_from_yaml"] is True
-
-    def test_placeholder_in_yaml_falls_back_to_state(self):
-        raw = {"sheet": "PASTE YOUR GOOGLE SHEET ADDRESS HERE"}
-        cfg = normalize_config(raw, "jane", {"sheet_id": SHEET_ID})
-        assert cfg["sheet_id"] == SHEET_ID
-        assert cfg["sheet_from_yaml"] is False
-
-    def test_no_sheet_anywhere(self):
-        assert normalize_config({}, "jane")["sheet_id"] is None
-
-    def test_load_config_reads_state(self, profiles):
-        folder = make_profile(profiles, "jane")
-        (folder / "config.yaml").write_text('locations: ["Berlin"]\n', encoding="utf-8")
-        write_state("jane", {"sheet_id": SHEET_ID})
-        assert config.load_config("jane")["sheet_id"] == SHEET_ID
-
-
 class TestState:
     def test_round_trip(self, profiles):
         make_profile(profiles, "jane")
-        write_state("jane", {"sheet_id": SHEET_ID, "auth": "oauth"})
-        assert read_state("jane") == {"sheet_id": SHEET_ID, "auth": "oauth"}
+        write_state("jane", {"workbook": "/x/jobs.xlsx", "created_at": "2026-10-01"})
+        assert read_state("jane") == {"workbook": "/x/jobs.xlsx", "created_at": "2026-10-01"}
         assert [p.name for p in (profiles / "jane").iterdir()] == ["agent-state.json"]
 
     def test_overwrite(self, profiles):
@@ -169,43 +185,3 @@ class TestState:
         folder = make_profile(profiles, "jane")
         (folder / "agent-state.json").write_text("{not json", encoding="utf-8")
         assert read_state("jane") == {}
-
-
-class TestChooseAuth:
-    @pytest.mark.parametrize(
-        ("raw", "key_exists", "expected"),
-        [
-            # dubai-bil: sheet set in config.yaml and a service-account key on disk
-            ({"sheet_id": SHEET_ID}, True, "service_account"),
-            ({"sheet": SHEET_ID}, True, "service_account"),
-            # Sheet in yaml but no key: nothing else can open it, so sign in with Google
-            ({"sheet": SHEET_ID}, False, "oauth"),
-            # A new user: no sheet in yaml; a stray key must not change that
-            ({}, True, "oauth"),
-            ({}, False, "oauth"),
-            # Explicit choice always wins
-            ({"auth": "oauth", "sheet": SHEET_ID}, True, "oauth"),
-            ({"auth": "service_account"}, False, "service_account"),
-            ({"auth": "auto", "sheet": SHEET_ID}, True, "service_account"),
-        ],
-    )
-    def test_matrix(self, raw, key_exists, expected):
-        assert choose_auth(normalize_config(raw, "jane"), key_exists) == expected
-
-    def test_sheet_from_state_alone_is_oauth(self):
-        cfg = normalize_config({}, "jane", {"sheet_id": SHEET_ID})
-        assert choose_auth(cfg, key_exists=True) == "oauth"
-
-
-class TestPaths:
-    def test_token_path_is_per_profile_under_secrets(self):
-        path = token_path("jane")
-        assert path.name == "jane.json"
-        assert path.parent.name == "tokens"
-        assert path.parent.parent.name == "secrets"
-
-    def test_oauth_client_default_and_override(self, monkeypatch, tmp_path):
-        monkeypatch.delenv("JOB_AGENT_OAUTH_CLIENT", raising=False)
-        assert oauth_client_path().name == "google_oauth_client.json"
-        monkeypatch.setenv("JOB_AGENT_OAUTH_CLIENT", str(tmp_path / "x.json"))
-        assert oauth_client_path() == tmp_path / "x.json"

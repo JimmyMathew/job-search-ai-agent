@@ -2,7 +2,7 @@
 
 The model's only job in a run is to read one batch file and write one scores file. Everything
 around that (choosing what to score, writing batch files, validating what came back, saving
-it to the sheet, retrying, resuming after a crash) is plain code here, so no job text ever
+it to the job list, retrying, resuming after a crash) is plain code here, so no job text ever
 passes through the orchestrating session and finished work is saved batch by batch.
 
 CLI (all paths are inside the run folder, runs/<profile>/<timestamp>/):
@@ -77,7 +77,7 @@ def plan_jobs(
     """Split deduped jobs into (to_score, over_cap, blocked_on_title).
 
     Newest first. Jobs a Block rule already rejects by title are set aside before the cap, so
-    the cap is never spent on them; they are still written to the sheet with their reason."""
+    the cap is never spent on them; they are still written to the job list with their reason."""
     newest_first = sorted(jobs, key=lambda j: j.get("posted_date") or "", reverse=True)
     passed, blocked = apply_block_rules(newest_first, rules, title_only=True)
     return passed[:cap], passed[cap:], blocked
@@ -221,7 +221,7 @@ def cmd_checkpoint(args: argparse.Namespace) -> None:
                     f"{'batch' if est['batches'] == 1 else 'batches'} of 10, roughly "
                     f"{est['tokens_in_k']}k tokens read and about {max(est['tokens_out_k'], 1)}k "
                     f"written by the scorer (a rough estimate). Every new job is added to your "
-                    f"sheet either way."
+                    f"job list either way."
                 ),
             }
         )
@@ -318,7 +318,7 @@ def cmd_next(args: argparse.Namespace) -> None:
 
 
 def ingest_batch(client: Any, run_dir: Path, n: int) -> str:
-    """Validate batch n's scores file, write what's valid to the sheet, queue retries."""
+    """Validate batch n's scores file, write what's valid to the job list, queue retries."""
     state = load_json(_state_path(run_dir))
     batch = next(b for b in state["batches"] if b["n"] == n)
     scores_file = _scores_path(run_dir, n)
@@ -353,7 +353,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
 
 
 def cmd_recover(args: argparse.Namespace) -> None:
-    """Save scores that an earlier, interrupted run already produced but never reached the sheet."""
+    """Save scores an earlier, interrupted run already produced but never wrote to the job list."""
     from sheet import SheetClient
 
     client, saved = None, []

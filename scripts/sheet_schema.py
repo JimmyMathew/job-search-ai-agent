@@ -1,8 +1,8 @@
-"""The layout of a person's Google Sheet, plus the pure (no network) logic around it.
+"""The layout of a person's Excel job list, plus the pure (no file access) logic around it.
 
 Jobs and Preferences are the job seeker's tabs; the AI_ prefix marks the tabs the agent
 owns (rules it learned, run bookkeeping, a record of which feedback it has already read).
-See CLAUDE.md's "Sheet design" section for why there is exactly one Jobs tab.
+See CLAUDE.md's "Workbook design" section for why there is exactly one Jobs tab.
 """
 
 from __future__ import annotations
@@ -44,19 +44,42 @@ TAB_HEADERS = {
     STATUS_SYNC_TAB: STATUS_SYNC_HEADERS,
 }
 
-SHEET_TITLE_PREFIX = "Job Search - "
+# The agent's bookkeeping tabs are hidden: the person has no reason to open them, and a
+# hidden tab can't be edited by accident. AI_Rules stays visible because the person may
+# edit or switch off a rule by hand.
+HIDDEN_TABS = frozenset({META_TAB, STATUS_SYNC_TAB})
+
+# Column widths in characters; headers not listed are sized to fit their title.
+COLUMN_WIDTHS = {
+    "Date added": 12,
+    "Score": 8,
+    "Job ID": 14,
+    "Job title": 36,
+    "Company": 26,
+    "Location": 24,
+    "Posted": 12,
+    "Link": 32,
+    "Why it matches": 60,
+    "Gaps": 40,
+    "Flags": 24,
+    "Role type": 12,
+    "Status": 20,
+    "Reason": 40,
+    "Criterion": 60,
+    "Value": 36,
+    "Example": 70,
+    "Rule": 60,
+    "Keywords": 30,
+    "Based on": 40,
+    "Key": 28,
+}
+
+WORKBOOK_FILENAME_PREFIX = "Job Search - "
 
 
-def sheet_title(profile: str) -> str:
-    """The title of the sheet the app creates; also how it finds that sheet again if the
-    local record of it is lost."""
-    return f"{SHEET_TITLE_PREFIX}{profile}"
-
-
-def default_tab_to_adopt(titles: list[str], first_tab_empty: bool) -> bool:
-    """True if a brand-new sheet's only tab is Google's empty default ("Sheet1" in the
-    person's language), which we rename to Jobs instead of leaving a stray empty tab."""
-    return len(titles) == 1 and titles[0] not in TAB_HEADERS and first_tab_empty
+def workbook_filename(profile: str) -> str:
+    """The file name of a person's job list (a plain name they can recognise in a folder)."""
+    return f"{WORKBOOK_FILENAME_PREFIX}{profile}.xlsx"
 
 
 STATUS_NEW = "New"
@@ -70,8 +93,9 @@ STATUS_VALUES = [
     "Offer",
 ]
 
-# Legacy: older sheets kept the feedback snapshot as one JSON blob in AI_MetaData
-# ({job_id: "status||reason"}). Read once to seed AI_StatusSync, never written again.
+# Legacy: lists that came from the Google Sheets version kept the feedback snapshot as one JSON
+# blob in AI_MetaData ({job_id: "status||reason"}). Read once to seed AI_StatusSync so feedback
+# already learned from isn't learned again; never written.
 LEGACY_STATUS_SNAPSHOT_KEY = "status_sync_snapshot"
 
 # Seeded once when the Preferences tab is created. A blank Value means "no preference

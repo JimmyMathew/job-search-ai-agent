@@ -17,7 +17,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from util import load_json, save_json, unwrap_jobs
+from util import load_json, run_cli, save_json, unwrap_jobs
 
 
 def _active_block_rules(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -97,4 +97,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_cli(main)

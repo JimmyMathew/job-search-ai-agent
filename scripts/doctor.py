@@ -10,27 +10,46 @@ from __future__ import annotations
 
 import argparse
 import importlib
-import json
+import re
 import sys
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from config import (
     PROFILES_DIR,
+    LegacySheet,
     ProfileError,
-    choose_auth,
-    credentials_path,
+    backups_dir,
+    find_legacy_sheet,
     find_resume,
     load_config,
-    oauth_client_path,
     profile_dir,
+    read_state,
+    sheet_command,
+    workbook_path,
 )
+from sheet_schema import TAB_HEADERS
+from util import run_cli
+
+if TYPE_CHECKING:
+    from workbook import Workbook
 
 REQUIRED_PACKAGES = {
     "jobspy": "python-jobspy",
-    "gspread": "gspread",
-    "google.auth": "google-auth",
-    "google_auth_oauthlib": "google-auth-oauthlib",
+    "openpyxl": "openpyxl",
     "yaml": "PyYAML",
 }
+# Folders that a sync program watches. Two copies of one file can end up as "conflict copies"
+# there, and the agent would then be updating a different file from the one the person reads.
+SYNCED_FOLDER_MARKERS = ("onedrive", "dropbox", "google drive", "googledrive")
+# What follows the list's own name in a copy a sync program or "Save a copy" made (see
+# find_conflict_copies). Only the conflict wording ignores case; a computer name is capitals.
+CONFLICT_SUFFIX_PATTERNS = (
+    r" \(\d+\)",
+    r"(?i: - copy(?: \(\d+\))?)",
+    r"(?i: \([^)]*conflict[^)]*\))",
+    r"-(?=[A-Z0-9_-]*[A-Z])[A-Z0-9_-]+",
+)
 
 failures = 0
 
@@ -44,91 +63,154 @@ def report(level: str, message: str, fix: str = "") -> None:
         print(f"         {line}")
 
 
-def check_service_account_key(key_path) -> str | None:
-    """Report on the service-account key; returns its client_email if it is usable."""
-    if not key_path.exists():
+def synced_folder_name(path: Path) -> str | None:
+    """The folder in this path that a sync program watches (OneDrive, Dropbox, Google Drive),
+    or None."""
+    for part in path.parts:
+        if any(marker in part.lower() for marker in SYNCED_FOLDER_MARKERS):
+            return part
+    return None
+
+
+def find_conflict_copies(path: Path) -> list[Path]:
+    """Other Excel files beside the job list that look like copies of it made by a sync program
+    or "Save a copy": the same name plus " (1)", " - Copy", "(... conflicted copy ...)" or, for
+    OneDrive, "-COMPUTERNAME" (capitals, which a profile name never is). Anything else that
+    merely starts with the same letters, such as another profile's list, is not a copy."""
+    if not path.parent.is_dir():
+        return []
+    suffixes = "|".join(CONFLICT_SUFFIX_PATTERNS)
+    pattern = re.compile(re.escape(path.stem) + f"(?:{suffixes})" + re.escape(path.suffix))
+    return sorted(
+        sibling
+        for sibling in path.parent.iterdir()
+        if sibling.name != path.name and pattern.fullmatch(sibling.name)
+    )
+
+
+def check_workbook(profile: str, config: dict) -> None:
+    """Report on the Excel job list: where it is, whether it opens, has every tab, is free to
+    be written, and is somewhere that could cause two copies. A profile that used a Google
+    sheet before is sent to its old data first."""
+    from workbook import Workbook  # needs openpyxl, which main() has already checked for
+
+    path = workbook_path(profile, config)
+    command = sheet_command(profile)
+    workbook = Workbook(path, backups_dir(profile), command=command)
+    legacy = find_legacy_sheet(config, read_state(profile))
+    if not workbook.exists():
+        _report_missing_list(command, path, legacy)
+        _warn_old_settings(config, delete_ok=False)
+        return
+    if not _check_workbook_opens(workbook, command):
+        return
+
+    report("OK", f"Job list: {path}")
+    _warn_old_settings(config, delete_ok=True)
+    _check_workbook_state(workbook, command)
+    synced = synced_folder_name(path)
+    if synced:
+        report(
+            "WARN",
+            f"The job list is inside a synced folder ({synced})",
+            "Syncing can create duplicate copies of the file. Keeping it in a normal folder\n"
+            "is safer: set `workbook:` in config.yaml, or move the whole project.",
+        )
+    copies = find_conflict_copies(path)
+    if copies:
+        report(
+            "WARN",
+            "Found other files that look like copies of your job list",
+            "\n".join(copy.name for copy in copies)
+            + "\nThe agent only updates the one named above. Keep the right one, delete the rest.",
+        )
+
+
+def _report_missing_list(command: str, path: Path, legacy: LegacySheet | None) -> None:
+    if legacy:
+        where = legacy.url or "a sheet called 'Job Search - <your profile>' in your Google Drive"
         report(
             "FIX",
-            f"Google key not found at {key_path}",
-            "Follow docs/service-account-setup.md (steps 1-4) and save the key there.",
+            f"This profile kept its job list in a Google sheet before: {where}",
+            "Open it, File > Download > Microsoft Excel (.xlsx), save it as\n"
+            f"{path}\n"
+            f"then run: {command} init\n"
+            "Do this BEFORE init: it keeps the history of jobs you have already seen.\n"
+            f"Only if you want to start with an empty list: {command} init --fresh",
         )
-        return None
+    else:
+        report("FIX", f"No job list yet (expected at {path})", f"Run: {command} init")
+
+
+def _warn_old_settings(config: dict, delete_ok: bool) -> None:
+    if not config.get("deprecated_keys"):
+        return
+    keys = ", ".join(f"`{key}`" for key in config["deprecated_keys"])
+    advice = (
+        "You can delete those lines."
+        if delete_ok
+        else "Keep them until your list is in place (see above)."
+    )
+    report(
+        "WARN",
+        f"config.yaml still has {keys}: no longer used, your results are in an Excel file",
+        advice,
+    )
+
+
+def _check_workbook_opens(workbook: Workbook, command: str) -> bool:
+    """Report a file that can't be read or lacks tabs. True when it loads and has every tab."""
+    from workbook import WorkbookBusy, WorkbookCorrupt, WorkbookError
+
     try:
-        client_email = json.loads(key_path.read_text(encoding="utf-8"))["client_email"]
-    except (ValueError, KeyError):
+        existing = set(workbook.tab_names())
+    except WorkbookCorrupt as exc:
         report(
             "FIX",
-            f"{key_path.name} is not a valid service-account key",
-            "Re-download the JSON key (docs/service-account-setup.md, step 4).",
+            "The job list can't be opened",
+            f"{exc}\nOr run: {command} restore-backup",
         )
-        return None
-    report("OK", f"Google key found. Share your sheet (as Editor) with:\n{client_email}")
-    return client_email
-
-
-def check_oauth_ready(profile: str, config: dict) -> bool:
-    """Report on the app's OAuth client, the person's sign-in and their sheet. True when a
-    sheet is known and the person is signed in, so it can be opened."""
-    from google_auth import NetworkProblem, SignInNeeded, get_credentials
-
-    connect_cmd = f"Run: uv run python scripts/sheet.py --profile {profile} connect"
-    # The app's client file is only needed to open the browser sign-in. A saved sign-in keeps
-    # working without it, so a missing file is a problem only when signing in is needed.
-    try:
-        get_credentials(profile)
-        report("OK", "Signed in to Google")
-        signed_in = True
-    except NetworkProblem as exc:
-        report("FIX", str(exc))
         return False
-    except SignInNeeded:
-        signed_in = False
-        if oauth_client_path().exists():
-            report("FIX", "Not signed in to Google yet", f"{connect_cmd}\n(it opens a browser tab)")
-        else:
-            report(
-                "FIX",
-                "Google sign-in isn't available in this copy of the app "
-                f"({oauth_client_path().name} is missing)",
-                "The project owner has to add it: see docs/maintainer-oauth-client.md",
-            )
-            return False
-    if not config.get("sheet_id"):
-        report("FIX", "No Google Sheet yet", connect_cmd)
+    except WorkbookBusy as exc:
+        report("WARN", "The job list is being updated right now", str(exc))
         return False
-    report("OK", f"Sheet: https://docs.google.com/spreadsheets/d/{config['sheet_id']}/edit")
-    return signed_in
+    except WorkbookError as exc:
+        report("FIX", "The job list can't be read", str(exc))
+        return False
+    missing = [tab for tab in TAB_HEADERS if tab not in existing]
+    if missing:
+        report(
+            "FIX",
+            f"The job list is missing tabs: {', '.join(missing)}",
+            f"Run: {command} init   (it only adds)",
+        )
+        return False
+    return True
 
 
-def check_sheet(profile: str, access_hint: str) -> None:
-    """Open the sheet and make sure every tab exists (creating missing ones)."""
-    try:
-        from sheet import SheetClient
-        from sheet_schema import TAB_HEADERS
-
-        client = SheetClient(profile)
-        report("OK", f"Sheet opens: {client.spreadsheet.title!r}")
-        existing = {ws.title for ws in client.spreadsheet.worksheets()}
-        needed = set(TAB_HEADERS)
-        if needed - existing:
-            client.init_tabs()  # only touches the sheet when a tab is missing
-            report("OK", "Created the missing tabs: " + ", ".join(sorted(needed - existing)))
-        else:
-            report("OK", "Tabs ready: " + ", ".join(TAB_HEADERS))
-    except Exception as exc:  # gspread raises several unrelated types
-        name, text = type(exc).__name__, str(exc)
-        if "SpreadsheetNotFound" in name or "404" in text:
-            report(
-                "FIX",
-                "Can't find the sheet",
-                access_hint
-                or "Was it deleted? Run `sheet.py --profile "
-                f"{profile} connect` to look for it again.",
-            )
-        elif "403" in text or "PERMISSION" in text.upper():
-            report("FIX", "Google refused access", access_hint or "Try signing in again.")
-        else:
-            report("FIX", f"Couldn't open the sheet: {name}: {text}")
+def _check_workbook_state(workbook: Workbook, command: str) -> None:
+    """Report what would stop a run from writing: read-only, open in Excel, leftovers."""
+    if workbook.is_read_only():
+        report(
+            "FIX",
+            "The job list is marked read-only",
+            "Right-click the file, choose Properties, untick Read-only and click OK\n"
+            "(on a Mac: Get Info, untick Locked).",
+        )
+    elif workbook.is_open():
+        report(
+            "WARN",
+            "The job list is open in Excel (or another program)",
+            "Save and close it before running /job-run, or the run can't write to it.",
+        )
+    leftovers = workbook.leftover_temp_files()
+    if leftovers:
+        report(
+            "WARN",
+            "Found half-written temporary files from an update that was cut off",
+            "\n".join(leftover.name for leftover in leftovers)
+            + f"\nYour job list is not affected. Run `{command} clear-lock` to delete them.",
+        )
 
 
 def main() -> None:
@@ -194,18 +276,8 @@ def main() -> None:
     else:
         report("WARN", "profile.md not written yet", f"In Claude Code, run: /job-setup {profile}")
 
-    if config and not missing:
-        key_path = credentials_path(config)
-        mode = choose_auth(config, key_path.exists())
-        if mode == "service_account":
-            report("OK", "Google access: service-account key (existing sheet)")
-            client_email = check_service_account_key(key_path)
-            if client_email:
-                check_sheet(profile, f"Share the sheet with {client_email} as Editor.")
-        else:
-            report("OK", "Google access: sign in with your Google account")
-            if check_oauth_ready(profile, config):
-                check_sheet(profile, "")
+    if config and "openpyxl" not in missing:
+        check_workbook(profile, config)
 
     if args.online and not missing and config:
         try:
@@ -233,4 +305,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_cli(main)

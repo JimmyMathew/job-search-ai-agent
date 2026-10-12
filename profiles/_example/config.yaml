@@ -7,12 +7,7 @@ locations:
   - "YOUR CITY, COUNTRY"   # replace this, e.g. "Berlin, Germany" or "Austin, TX"
   # - "Remote"
 
-# 2. YOUR GOOGLE SHEET: leave this alone. Setup signs you in to Google and creates the
-#    sheet for you, then remembers it. Only set `sheet:` if you want to use a sheet you
-#    already made yourself (advanced: docs/service-account-setup.md).
-# sheet: "https://docs.google.com/spreadsheets/d/.../edit"
-
-# 3. WHAT roles to search for (optional).
+# 2. WHAT roles to search for (optional).
 #    Leave this empty and the AI reads your resume and suggests roles for you to approve
 #    when you run /job-setup. Or list the titles you want:
 roles: []
@@ -23,19 +18,16 @@ roles: []
 explore_adjacent_roles: true
 
 # ---- Advanced: you can ignore everything below ----------------------------------------
+# Your job list is an Excel file in this folder, named "Job Search - <your profile>.xlsx".
+# To keep it somewhere else, give its full path (ending in .xlsx), or one starting with ~.
+# Avoid folders that sync to the cloud (OneDrive, Dropbox...): they can create duplicate copies.
+# workbook: ~/Documents/My job search.xlsx
+
 # Default cap on how many jobs the AI scores per run (this uses your Claude usage); you are asked before each run.
-# Every new job still lands in your sheet, scored or not.
+# Every new job still lands in your job list, scored or not.
 # max_jobs_to_score_per_run: 60
 # Smaller cap for your very first run, so you can see results before spending more.
 # first_run_max_jobs_to_score: 30
 
 # How many hours back to search on your very first run.
 # first_run_hours_old: 72
-
-# How the app reaches Google. "auto" signs you in with your Google account, unless you set
-# `sheet:` above and have a service-account key, in which case that key is used.
-# Other values: oauth, service_account.
-# auth: auto
-
-# Only for service_account: where the key lives (relative to the project folder).
-# credentials: secrets/service-account.json

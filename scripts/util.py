@@ -3,7 +3,9 @@ trimming and repost detection. Profile/config handling lives in config.py."""
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
 import sys
 from collections.abc import Callable
@@ -15,13 +17,41 @@ from config import RUNS_DIR, UserFacingError
 
 _JOB_ID_RE = re.compile(r"/jobs/view/(\d+)")
 
+DEBUG_ENV_VAR = "JOB_AGENT_DEBUG"
+
+
+class DataFileError(UserFacingError):
+    """A JSON file a script was told to read is missing or isn't valid."""
+
+
+def _use_utf8_output() -> None:
+    """Job titles can hold any language or emoji. A piped Windows shell encodes output as a
+    legacy code page, so printing them would raise UnicodeEncodeError; write UTF-8 instead,
+    replacing anything that still can't be written."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            with contextlib.suppress(ValueError, OSError):  # closed or already-read stream
+                reconfigure(encoding="utf-8", errors="replace")
+
 
 def run_cli(main: Callable[[], None]) -> None:
-    """Run a script's main(); a UserFacingError ends it with its plain message, not a traceback."""
+    """Run a script's main() the way a person should see it: UTF-8 output, a plain message for a
+    UserFacingError, and for any other failure one plain sentence instead of a traceback (set
+    JOB_AGENT_DEBUG=1 to see the traceback)."""
+    _use_utf8_output()
     try:
         main()
     except UserFacingError as exc:
         sys.exit(str(exc))
+    except Exception:
+        if os.environ.get(DEBUG_ENV_VAR):
+            raise
+        sys.exit(
+            "Something unexpected went wrong. Run the same command again; if it keeps "
+            f"happening, set {DEBUG_ENV_VAR}=1 and run it once more to see the technical "
+            "details."
+        )
 
 
 def extract_job_id(url: str) -> str | None:
@@ -101,8 +131,13 @@ def unwrap_jobs(payload: Any) -> list[dict[str, Any]]:
 
 
 def load_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except OSError as exc:
+        raise DataFileError(f"Couldn't read {path}: {exc.strerror or exc}") from exc
+    except ValueError as exc:
+        raise DataFileError(f"{path} isn't valid JSON: {exc}") from exc
 
 
 def save_json(path: Path, data: Any) -> None:
